@@ -22,7 +22,7 @@ defaults:
 
 jobs:
   container:
-    if: github.repository == 'juanfont/headscale'
+    if: github.repository == 'Huangxuny1/headscale'
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -52,7 +52,7 @@ jobs:
 
       - name: Build and push to GHCR
         env:
-          KO_DOCKER_REPO: ghcr.io/juanfont/headscale
+          KO_DOCKER_REPO: ghcr.io/Huangxuny1/headscale
           KO_DEFAULTBASEIMAGE: gcr.io/distroless/base-debian13
           CGO_ENABLED: "0"
         run: |
@@ -62,20 +62,20 @@ jobs:
             --tags=main-${GITHUB_SHA::7},development \
             ./cmd/headscale
 
-      - name: Push to Docker Hub
-        env:
-          KO_DOCKER_REPO: headscale/headscale
-          KO_DEFAULTBASEIMAGE: gcr.io/distroless/base-debian13
-          CGO_ENABLED: "0"
-        run: |
-          ko build \
-            --bare \
-            --platform=linux/amd64,linux/arm64 \
-            --tags=main-${GITHUB_SHA::7},development \
-            ./cmd/headscale
+      # - name: Push to Docker Hub
+      #   env:
+      #     KO_DOCKER_REPO: headscale/headscale
+      #     KO_DEFAULTBASEIMAGE: gcr.io/distroless/base-debian13
+      #     CGO_ENABLED: "0"
+      #   run: |
+      #     ko build \
+      #       --bare \
+      #       --platform=linux/amd64,linux/arm64 \
+      #       --tags=main-${GITHUB_SHA::7},development \
+      #       ./cmd/headscale
 
   binaries:
-    if: github.repository == 'juanfont/headscale'
+    if: github.repository == 'Huangxuny1/headscale'
     runs-on: ubuntu-latest
     strategy:
       matrix:
