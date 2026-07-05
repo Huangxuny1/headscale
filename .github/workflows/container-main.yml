@@ -52,7 +52,7 @@ jobs:
 
       - name: Build and push to GHCR
         env:
-          KO_DOCKER_REPO: ghcr.io/Huangxuny1/headscale
+          KO_DOCKER_REPO: ghcr.io/huangxuny1/headscale
           KO_DEFAULTBASEIMAGE: gcr.io/distroless/base-debian13
           CGO_ENABLED: "0"
         run: |
