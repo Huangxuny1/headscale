@@ -648,3 +648,59 @@ func TestGenerateDNSConfigNilHostinfoNoPanic(t *testing.T) {
 		generateDNSConfig(cfg, node, nil)
 	}, "generateDNSConfig must not panic when a node has nil Hostinfo")
 }
+
+func TestCertDomains(t *testing.T) {
+	t.Parallel()
+
+	node := (&types.Node{
+		ID:       1,
+		Hostname: "mynode",
+		Hostinfo: &tailcfg.Hostinfo{OS: "linux"},
+	}).View()
+
+	tests := []struct {
+		name        string
+		certEnabled bool
+		baseDomain  string
+		want        []string
+	}{
+		{
+			name:        "cert enabled with base domain",
+			certEnabled: true,
+			baseDomain:  "example.com",
+			want:        []string{"mynode.example.com"},
+		},
+		{
+			name:        "cert disabled",
+			certEnabled: false,
+			baseDomain:  "example.com",
+			want:        nil,
+		},
+		{
+			name:        "cert enabled but no base domain",
+			certEnabled: true,
+			baseDomain:  "",
+			want:        nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &types.Config{
+				BaseDomain: tt.baseDomain,
+				Cert: types.CertConfig{
+					Enabled: tt.certEnabled,
+				},
+				TailcfgDNSConfig: &tailcfg.DNSConfig{
+					Domains: []string{tt.baseDomain},
+				},
+			}
+
+			got := generateDNSConfig(cfg, node, nil)
+			require.NotNil(t, got)
+			assert.Equal(t, tt.want, got.CertDomains)
+		})
+	}
+}

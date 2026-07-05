@@ -151,6 +151,8 @@ type Config struct {
 
 	Policy PolicyConfig
 
+	Cert CertConfig
+
 	Tuning Tuning
 }
 
@@ -274,6 +276,22 @@ type TaildropConfig struct {
 // opted in or out locally.
 type AutoUpdateConfig struct {
 	Enabled bool
+}
+
+// CertConfig controls tailscale cert / serve support.
+// When enabled, Headscale populates CertDomains in MapResponse and handles
+// /machine/set-dns requests for ACME DNS-01 challenges.
+type CertConfig struct {
+	Enabled     bool
+	DNSProvider DNSProviderConfig `mapstructure:"dns_provider"`
+}
+
+// DNSProviderConfig identifies the libdns-based DNS provider used to
+// provision ACME challenge TXT records (and, in the future, Funnel
+// A/AAAA records).
+type DNSProviderConfig struct {
+	Name   string            `mapstructure:"name"`
+	Config map[string]string `mapstructure:"config"`
 }
 
 type CLIConfig struct {
@@ -478,6 +496,9 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("logtail.enabled", false)
 	viper.SetDefault("taildrop.enabled", true)
 	viper.SetDefault("auto_update.enabled", false)
+
+	viper.SetDefault("cert.enabled", false)
+	viper.SetDefault("cert.dns_provider.name", "")
 
 	viper.SetDefault("node.expiry", "0")
 	viper.SetDefault("node.ephemeral.inactivity_timeout", "120s")
@@ -812,6 +833,18 @@ func policyConfig() PolicyConfig {
 		Path: policyPath,
 		Mode: PolicyMode(policyMode),
 	}
+}
+
+func certConfig() CertConfig {
+	cfg := CertConfig{
+		Enabled: viper.GetBool("cert.enabled"),
+		DNSProvider: DNSProviderConfig{
+			Name:   viper.GetString("cert.dns_provider.name"),
+			Config: viper.GetStringMapString("cert.dns_provider.config"),
+		},
+	}
+
+	return cfg
 }
 
 func logConfig() LogConfig {
@@ -1289,6 +1322,8 @@ func LoadServerConfig() (*Config, error) {
 		AutoUpdate: AutoUpdateConfig{
 			Enabled: viper.GetBool("auto_update.enabled"),
 		},
+
+		Cert: certConfig(),
 
 		Policy: policyConfig(),
 

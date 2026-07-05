@@ -147,6 +147,16 @@ func generateDNSConfig(
 		}
 	}
 
+	// Populate CertDomains when cert support is enabled. This tells the
+	// Tailscale client which domains it can request TLS certificates for
+	// via `tailscale cert`. The domain follows the MagicDNS naming scheme:
+	// <hostname>.<base_domain>.
+	if cfg.Cert.Enabled && cfg.BaseDomain != "" {
+		dnsConfig.CertDomains = []string{
+			node.Hostname() + "." + cfg.BaseDomain,
+		}
+	}
+
 	return dnsConfig
 }
 

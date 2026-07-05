@@ -99,6 +99,11 @@ var (
 // without the matching server-side machinery would be misleading — nodes
 // would advertise a feature that does not work. Reject at policy load and
 // point operators at the issue.
+//
+// NOTE: Remove NodeAttrFunnel from this map when Funnel support is
+// implemented. The "serve" feature does NOT require this cap — only
+// funnel does. See QueryFeatureHandler in noise_feature.go for the
+// serve enablement gate.
 var nodeAttrUnsupportedCaps = map[tailcfg.NodeCapability]string{
 	tailcfg.NodeAttrFunnel: "https://github.com/juanfont/headscale/issues/2527",
 }
