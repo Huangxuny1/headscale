@@ -1,8 +1,10 @@
 package hscontrol
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -17,6 +19,15 @@ const (
 	// 120s is common for ACME challenges — short enough to not pollute
 	// DNS caches after the challenge completes.
 	acmeTXTTTL = 120 * time.Second
+
+	// acmePropagationTimeout bounds how long SetDNSHandler waits for a
+	// freshly-written TXT record to become visible on the zone's
+	// authoritative nameservers before returning to the client.
+	acmePropagationTimeout = 60 * time.Second
+
+	// acmePropagationPoll is the interval between authoritative-NS
+	// lookups while waiting for propagation.
+	acmePropagationPoll = 2 * time.Second
 )
 
 // SetDNSHandler handles POST /machine/set-dns. It accepts a
@@ -124,9 +135,21 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 		Str("name", dnsReq.Name).
 		Str("relative_name", relativeName).
 		Str("zone", zone).
+		Str("type", dnsReq.Type).
+		Str("value", dnsReq.Value).
+		Str("base_domain", ns.headscale.cfg.BaseDomain).
+		Dur("propagation_timeout", acmePropagationTimeout).
 		Msg("setting DNS TXT record for ACME challenge")
 
+	setStart := time.Now()
 	if err := ns.headscale.dnsProvider.SetRecord(req.Context(), zone, record); err != nil {
+		log.Error().Err(err).
+			Str("node", nv.Hostname()).
+			Str("name", dnsReq.Name).
+			Str("zone", zone).
+			Dur("elapsed", time.Since(setStart)).
+			Msg("DNS provider rejected TXT record write")
+
 		httpError(writer, NewHTTPError(
 			http.StatusInternalServerError,
 			"failed to set DNS record",
@@ -134,6 +157,38 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 		))
 
 		return
+	}
+
+	log.Debug().
+		Str("node", nv.Hostname()).
+		Str("name", dnsReq.Name).
+		Str("zone", zone).
+		Dur("elapsed", time.Since(setStart)).
+		Msg("TXT record written to DNS provider; waiting for propagation")
+
+	// Wait until the TXT record is visible on the zone's authoritative
+	// nameservers before responding. The Tailscale client asks Let's
+	// Encrypt to validate the DNS-01 challenge immediately after this
+	// call returns; if we return before the record has propagated, LE
+	// queries the authoritative NS, finds no (or a stale) record, and
+	// marks the ACME order "invalid". Blocking here removes that race.
+	// Best-effort: on timeout we log and proceed, since the record was
+	// written successfully.
+	if err := waitForTXTPropagation(
+		req.Context(),
+		zoneName,
+		dnsReq.Name,
+		dnsReq.Value,
+	); err != nil {
+		log.Warn().Err(err).
+			Str("node", nv.Hostname()).
+			Str("name", dnsReq.Name).
+			Msg("could not confirm TXT propagation; responding anyway")
+	} else {
+		log.Info().
+			Str("node", nv.Hostname()).
+			Str("name", dnsReq.Name).
+			Msg("TXT record confirmed on authoritative nameservers")
 	}
 
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -160,4 +215,89 @@ func (h *Headscale) validateCertDNSName(node interface{ Hostname() string }, nam
 	expected := "_acme-challenge." + node.Hostname() + "." + h.cfg.BaseDomain
 
 	return strings.EqualFold(name, expected)
+}
+
+// waitForTXTPropagation blocks until the TXT record named fqdn contains
+// expectedValue on the authoritative nameservers for zone, or until the
+// timeout elapses. It queries the zone's authoritative NS directly to
+// avoid resolver-side negative caching.
+func waitForTXTPropagation(ctx context.Context, zone, fqdn, expectedValue string) error {
+	zone = strings.TrimSuffix(zone, ".")
+
+	nsRecords, err := net.LookupNS(zone)
+	if err != nil {
+		return fmt.Errorf("looking up NS for zone %q: %w", zone, err)
+	}
+	if len(nsRecords) == 0 {
+		return fmt.Errorf("no NS records found for zone %q", zone)
+	}
+
+	authNS := strings.TrimSuffix(nsRecords[0].Host, ".")
+
+	nsHosts := make([]string, len(nsRecords))
+	for i, rec := range nsRecords {
+		nsHosts[i] = strings.TrimSuffix(rec.Host, ".")
+	}
+
+	log.Debug().
+		Str("zone", zone).
+		Str("fqdn", fqdn).
+		Strs("nameservers", nsHosts).
+		Str("query_ns", authNS).
+		Str("expected_value", expectedValue).
+		Msg("waiting for TXT record propagation on authoritative nameserver")
+
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+
+			return d.DialContext(ctx, network, net.JoinHostPort(authNS, "53"))
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, acmePropagationTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(acmePropagationPoll)
+	defer ticker.Stop()
+
+	start := time.Now()
+	for attempt := 1; ; attempt++ {
+		txts, lookupErr := resolver.LookupTXT(ctx, fqdn)
+
+		e := log.Debug().
+			Int("attempt", attempt).
+			Dur("elapsed", time.Since(start)).
+			Str("fqdn", fqdn).
+			Str("query_ns", authNS).
+			Strs("found", txts)
+		if lookupErr != nil {
+			e = e.AnErr("lookup_error", lookupErr)
+		}
+		e.Msg("polling authoritative NS for TXT record")
+
+		if lookupErr == nil {
+			for _, txt := range txts {
+				if txt == expectedValue {
+					log.Debug().
+						Int("attempt", attempt).
+						Dur("elapsed", time.Since(start)).
+						Str("fqdn", fqdn).
+						Msg("TXT record value matched on authoritative NS")
+
+					return nil
+				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf(
+				"timed out after %s (%d attempts) waiting for TXT %q on %s",
+				acmePropagationTimeout, attempt, fqdn, authNS,
+			)
+		case <-ticker.C:
+		}
+	}
 }
