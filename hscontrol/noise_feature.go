@@ -15,7 +15,8 @@ import (
 func (ns *noiseServer) QueryFeatureHandler(writer http.ResponseWriter, req *http.Request) {
 	var featureReq tailcfg.QueryFeatureRequest
 
-	if err := json.NewDecoder(req.Body).Decode(&featureReq); err != nil {
+	err := json.NewDecoder(req.Body).Decode(&featureReq)
+	if err != nil {
 		httpError(writer, NewHTTPError(
 			http.StatusBadRequest,
 			"invalid QueryFeatureRequest",
@@ -34,7 +35,8 @@ func (ns *noiseServer) QueryFeatureHandler(writer http.ResponseWriter, req *http
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
 
-	if err := json.NewEncoder(writer).Encode(resp); err != nil {
+	err = json.NewEncoder(writer).Encode(resp)
+	if err != nil {
 		log.Error().Err(err).Msg("failed to encode QueryFeatureResponse")
 	}
 
