@@ -4,9 +4,9 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/libdns/cloudflare"
 	"github.com/libdns/libdns"
-	"github.com/juanfont/headscale/hscontrol/types"
 )
 
 // ErrUnknownProvider is returned when the configured provider name
