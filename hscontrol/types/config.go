@@ -290,7 +290,14 @@ type CertConfig struct {
 // provision ACME challenge TXT records (and, in the future, Funnel
 // A/AAAA records).
 type DNSProviderConfig struct {
-	Name   string            `mapstructure:"name"`
+	Name string `mapstructure:"name"`
+	// Zone is the authoritative DNS zone registered with the provider
+	// (e.g. "workspace.beer"). It may differ from base_domain, which
+	// can be a subdomain such as "pre-magic.workspace.beer". This
+	// matters on providers like Cloudflare (especially the free plan)
+	// where only the registered domain is a zone, not its subdomains.
+	// When empty, base_domain is used for backwards compatibility.
+	Zone   string            `mapstructure:"zone"`
 	Config map[string]string `mapstructure:"config"`
 }
 
@@ -499,6 +506,7 @@ func LoadConfig(path string, isFile bool) error {
 
 	viper.SetDefault("cert.enabled", false)
 	viper.SetDefault("cert.dns_provider.name", "")
+	viper.SetDefault("cert.dns_provider.zone", "")
 
 	viper.SetDefault("node.expiry", "0")
 	viper.SetDefault("node.ephemeral.inactivity_timeout", "120s")
@@ -840,6 +848,7 @@ func certConfig() CertConfig {
 		Enabled: viper.GetBool("cert.enabled"),
 		DNSProvider: DNSProviderConfig{
 			Name:   viper.GetString("cert.dns_provider.name"),
+			Zone:   viper.GetString("cert.dns_provider.zone"),
 			Config: viper.GetStringMapString("cert.dns_provider.config"),
 		},
 	}

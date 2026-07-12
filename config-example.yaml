@@ -476,6 +476,14 @@ auto_update:
 #     # Provider name. Currently supported: "cloudflare"
 #     # Future: "route53", "gcloud", "rfc2136", etc.
 #     name: "cloudflare"
+#     # The authoritative DNS zone registered with the provider. Set this
+#     # when base_domain is a subdomain of your registered domain. For
+#     # example, if base_domain is "pre-magic.workspace.beer" but the zone
+#     # registered in Cloudflare is "workspace.beer", set zone to
+#     # "workspace.beer". This is required on Cloudflare's free plan,
+#     # which does not support subdomain zones. When left empty,
+#     # base_domain is used as the zone.
+#     zone: ""
 #     # Provider-specific configuration (key-value pairs).
 #     config:
 #       api_token: "your-cloudflare-api-token-with-zone-dns-edit"

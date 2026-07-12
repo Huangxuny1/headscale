@@ -98,14 +98,24 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	// The zone for libdns is the base_domain with a trailing dot.
-	zone := ns.headscale.cfg.BaseDomain + "."
+	// The DNS zone registered with the provider. This may differ from
+	// base_domain: base_domain can be a subdomain (e.g.
+	// "pre-magic.workspace.beer") while the provider's authoritative
+	// zone is the registered domain ("workspace.beer"). This matters on
+	// providers like Cloudflare where a subdomain is not its own zone.
+	// Fall back to base_domain when zone is not explicitly configured.
+	zoneName := ns.headscale.cfg.Cert.DNSProvider.Zone
+	if zoneName == "" {
+		zoneName = ns.headscale.cfg.BaseDomain
+	}
+	zoneName = strings.TrimSuffix(zoneName, ".")
+	zone := zoneName + "."
 
 	// The record name is relative to the zone. Strip the zone suffix
 	// from the FQDN to get the relative name.
-	// e.g., "_acme-challenge.mynode.example.com" in zone "example.com."
-	// becomes "_acme-challenge.mynode"
-	relativeName := strings.TrimSuffix(dnsReq.Name, "."+ns.headscale.cfg.BaseDomain)
+	// e.g., "_acme-challenge.ubuntu.pre-magic.workspace.beer" in zone
+	// "workspace.beer." becomes "_acme-challenge.ubuntu.pre-magic"
+	relativeName := strings.TrimSuffix(dnsReq.Name, "."+zoneName)
 
 	record := hsdns.NewTXTRecord(relativeName, dnsReq.Value, acmeTXTTTL)
 
