@@ -149,11 +149,14 @@ func generateDNSConfig(
 
 	// Populate CertDomains when cert support is enabled. This tells the
 	// Tailscale client which domains it can request TLS certificates for
-	// via `tailscale cert`. The domain follows the MagicDNS naming scheme:
-	// <hostname>.<base_domain>.
+	// via `tailscale cert`. The domain must match the node's MagicDNS
+	// name, which is built from GivenName (the sanitised DNS label), not
+	// the raw OS hostname — see Node.GetFQDN. Using Hostname() here would
+	// produce a CertDomains entry the client never connects to, so it
+	// would refuse to start the ACME flow.
 	if cfg.Cert.Enabled && cfg.BaseDomain != "" {
 		dnsConfig.CertDomains = []string{
-			node.Hostname() + "." + cfg.BaseDomain,
+			node.GivenName() + "." + cfg.BaseDomain,
 		}
 	}
 

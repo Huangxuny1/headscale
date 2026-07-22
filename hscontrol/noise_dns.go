@@ -220,14 +220,17 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 
 // validateCertDNSName checks whether the given DNS name is allowed for
 // the node. A node may only set TXT records for its own ACME challenge
-// subdomain: _acme-challenge.<hostname>.<base_domain>.
-func (h *Headscale) validateCertDNSName(node interface{ Hostname() string }, name string) bool {
+// subdomain: _acme-challenge.<given-name>.<base_domain>. GivenName is
+// the sanitised DNS label used for the node's MagicDNS name (see
+// Node.GetFQDN), which is what the ACME challenge FQDN is derived from —
+// the raw OS hostname may differ and must not be used here.
+func (h *Headscale) validateCertDNSName(node interface{ GivenName() string }, name string) bool {
 	if h.cfg.BaseDomain == "" {
 		return false
 	}
 
 	// The expected ACME challenge record name for this node.
-	expected := "_acme-challenge." + node.Hostname() + "." + h.cfg.BaseDomain
+	expected := "_acme-challenge." + node.GivenName() + "." + h.cfg.BaseDomain
 
 	return strings.EqualFold(name, expected)
 }

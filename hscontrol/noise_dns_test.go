@@ -7,61 +7,61 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-type mockHostnameNode struct {
-	hostname string
+type mockGivenNameNode struct {
+	givenName string
 }
 
-func (m mockHostnameNode) Hostname() string {
-	return m.hostname
+func (m mockGivenNameNode) GivenName() string {
+	return m.givenName
 }
 
 func TestValidateCertDNSName(t *testing.T) {
 	tests := []struct {
 		name       string
 		baseDomain string
-		hostname   string
+		givenName  string
 		dnsName    string
 		want       bool
 	}{
 		{
 			name:       "valid acme challenge for node",
 			baseDomain: "example.com",
-			hostname:   "mynode",
+			givenName:  "mynode",
 			dnsName:    "_acme-challenge.mynode.example.com",
 			want:       true,
 		},
 		{
 			name:       "case insensitive match",
 			baseDomain: "example.com",
-			hostname:   "MyNode",
+			givenName:  "MyNode",
 			dnsName:    "_acme-challenge.mynode.example.com",
 			want:       true,
 		},
 		{
 			name:       "wrong node hostname",
 			baseDomain: "example.com",
-			hostname:   "mynode",
+			givenName:  "mynode",
 			dnsName:    "_acme-challenge.othernode.example.com",
 			want:       false,
 		},
 		{
 			name:       "wrong domain",
 			baseDomain: "example.com",
-			hostname:   "mynode",
+			givenName:  "mynode",
 			dnsName:    "_acme-challenge.mynode.evil.com",
 			want:       false,
 		},
 		{
 			name:       "not an acme challenge",
 			baseDomain: "example.com",
-			hostname:   "mynode",
+			givenName:  "mynode",
 			dnsName:    "mynode.example.com",
 			want:       false,
 		},
 		{
 			name:       "empty base domain",
 			baseDomain: "",
-			hostname:   "mynode",
+			givenName:  "mynode",
 			dnsName:    "_acme-challenge.mynode.example.com",
 			want:       false,
 		},
@@ -74,7 +74,7 @@ func TestValidateCertDNSName(t *testing.T) {
 					BaseDomain: tt.baseDomain,
 				},
 			}
-			node := mockHostnameNode{hostname: tt.hostname}
+			node := mockGivenNameNode{givenName: tt.givenName}
 
 			got := h.validateCertDNSName(node, tt.dnsName)
 			assert.Equal(t, tt.want, got)
