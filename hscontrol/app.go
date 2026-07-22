@@ -96,6 +96,11 @@ type Headscale struct {
 	authProvider   AuthProvider
 	mapBatcher     *mapper.Batcher
 
+	// dnsProvider manages DNS records for ACME DNS-01 challenges
+	// (tailscale cert) and, in the future, Funnel A/AAAA records.
+	// Nil when cert support is disabled.
+	dnsProvider dns.Provider
+
 	clientStreamsOpen sync.WaitGroup
 }
 
@@ -185,6 +190,18 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 	}
 
 	app.authProvider = authProvider
+
+	// Initialize DNS provider for cert/serve support.
+	if cfg.Cert.Enabled {
+		dnsProvider, err := dns.NewProvider(cfg.Cert)
+		if err != nil {
+			return nil, fmt.Errorf("initialising cert DNS provider: %w", err)
+		}
+
+		app.dnsProvider = dnsProvider
+
+		log.Info().Str("provider", cfg.Cert.DNSProvider.Name).Msg("cert support enabled with DNS provider")
+	}
 
 	if app.cfg.TailcfgDNSConfig != nil && app.cfg.TailcfgDNSConfig.Proxied { // if MagicDNS
 		// TODO(kradalby): revisit why this takes a list.
