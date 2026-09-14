@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 )
@@ -62,7 +61,15 @@ dns:
   magic_dns: true
   base_domain: headscale.dev
   override_local_dns: false
-
+cert:
+  enabled: false
+  dns_provider:
+    # Provider name. Currently supported: "cloudflare"
+    # Future: "route53", "gcloud", "rfc2136", etc.
+    name: "cloudflare"
+    # Provider-specific configuration (key-value pairs).
+    config:
+      api_token: "123"
 log:
   level: debug
   format: text
@@ -175,7 +182,7 @@ func run() error {
 	keyJSON, err := runHS(
 		ctx, hsBin, configPath,
 		"preauthkeys", "create",
-		"-u", strconv.FormatUint(userID, 10),
+		"-u", userID,
 		"--reusable",
 		"-e", "24h",
 		"-o", "json",
@@ -279,14 +286,14 @@ func runHS(ctx context.Context, bin, config string, args ...string) ([]byte, err
 
 // extractUserID parses the JSON output of "users create" and returns the
 // user ID.
-func extractUserID(data []byte) (uint64, error) {
+func extractUserID(data []byte) (string, error) {
 	var user struct {
-		ID uint64 `json:"id"`
+		ID string `json:"id"`
 	}
 
 	err := json.Unmarshal(data, &user)
 	if err != nil {
-		return 0, fmt.Errorf("unmarshalling user JSON: %w (raw: %s)", err, data)
+		return "1", fmt.Errorf("unmarshalling user JSON: %w (raw: %s)", err, data)
 	}
 
 	return user.ID, nil

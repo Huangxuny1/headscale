@@ -460,6 +460,34 @@ taildrop:
 auto_update:
   enabled: false
 
+# Certificate provisioning for tailscale cert / tailscale serve.
+# When enabled, Headscale populates CertDomains in MapResponse so nodes
+# can request TLS certificates for their MagicDNS names, and handles
+# /machine/set-dns requests for ACME DNS-01 challenges.
+#
+# Requires:
+#   - dns.magic_dns: true
+#   - dns.base_domain set to a domain you control
+#   - A DNS provider configured below with permissions to create TXT records
+#
+# cert:
+#   enabled: false
+#   dns_provider:
+#     # Provider name. Currently supported: "cloudflare"
+#     # Future: "route53", "gcloud", "rfc2136", etc.
+#     name: "cloudflare"
+#     # The authoritative DNS zone registered with the provider. Set this
+#     # when base_domain is a subdomain of your registered domain. For
+#     # example, if base_domain is "pre-magic.workspace.beer" but the zone
+#     # registered in Cloudflare is "workspace.beer", set zone to
+#     # "workspace.beer". This is required on Cloudflare's free plan,
+#     # which does not support subdomain zones. When left empty,
+#     # base_domain is used as the zone.
+#     zone: ""
+#     # Provider-specific configuration (key-value pairs).
+#     config:
+#       api_token: "your-cloudflare-api-token-with-zone-dns-edit"
+
 # Advanced performance tuning parameters.
 # The defaults are carefully chosen and should rarely need adjustment.
 # Only modify these if you have identified a specific performance issue.
