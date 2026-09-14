@@ -154,12 +154,15 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		}
 
 		policyChanged, err := app.state.DeleteNode(node)
+		if !policyChanged.IsEmpty() {
+			app.Change(policyChanged)
+		}
+
 		if err != nil {
 			log.Error().Err(err).EmbedObject(node).Msg("ephemeral node deletion failed")
 			return
 		}
 
-		app.Change(policyChanged)
 		log.Debug().Caller().EmbedObject(node).Msg("ephemeral node deleted because garbage collection timeout reached")
 	})
 	app.ephemeralGC = ephemeralGC
@@ -492,6 +495,7 @@ func (h *Headscale) createRouter(apiV1Mux, apiV2Mux http.Handler) *chi.Mux {
 
 	if provider, ok := h.authProvider.(*AuthProviderOIDC); ok {
 		r.Get("/oidc/callback", provider.OIDCCallbackHandler)
+		r.Get("/register/confirm/{auth_id}", provider.RegisterConfirmGetHandler)
 		r.Post("/register/confirm/{auth_id}", provider.RegisterConfirmHandler)
 	}
 
@@ -753,7 +757,7 @@ func (h *Headscale) Serve() error {
 		log.Info().Msg("metrics server disabled (metrics_listen_addr is empty)")
 	}
 
-	var tailsqlContext context.Context
+	var tailsqlCancel context.CancelFunc
 
 	if tailsqlEnabled {
 		if h.cfg.Database.Type != types.DatabaseSqlite {
@@ -768,9 +772,13 @@ func (h *Headscale) Serve() error {
 			log.Fatal().Msg("tailsql requires TS_AUTHKEY to be set")
 		}
 
-		tailsqlContext = context.Background()
+		var tailsqlCtx context.Context
 
-		go runTailSQLService(ctx, util.TSLogfWrapper(), tailsqlStateDir, h.cfg.Database.Sqlite.Path) //nolint:errcheck
+		tailsqlCtx, tailsqlCancel = context.WithCancel(ctx)
+
+		errorGroup.Go(func() error {
+			return runTailSQLService(tailsqlCtx, util.TSLogfWrapper(), tailsqlStateDir, h.cfg.Database.Sqlite.Path)
+		})
 	}
 
 	// Handle common process-killing signals so we can gracefully shut down:
@@ -849,9 +857,9 @@ func (h *Headscale) Serve() error {
 					log.Error().Err(err).Msg("failed to shutdown socket server")
 				}
 
-				if tailsqlContext != nil {
+				if tailsqlCancel != nil {
 					info("shutting down tailsql")
-					tailsqlContext.Done()
+					tailsqlCancel()
 				}
 
 				// Close network listeners
