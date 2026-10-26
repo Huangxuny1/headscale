@@ -2,6 +2,7 @@ package v2
 
 import (
 	"fmt"
+	"maps"
 	"net/netip"
 	"slices"
 
@@ -482,6 +483,21 @@ func buildSrcIPStrings(
 	return srcIPStrs
 }
 
+type resolvedDestination struct {
+	Alias
+
+	addresses ResolvedAddresses
+	err       error
+}
+
+func (dst resolvedDestination) Resolve(
+	_ *Policy,
+	_ types.Users,
+	_ views.Slice[types.NodeView],
+) (ResolvedAddresses, error) {
+	return dst.addresses, dst.err
+}
+
 // compileOtherDests compiles filter rules for non-self, non-via
 // destinations. This produces both [tailcfg.FilterRule.DstPorts] rules
 // (from [Grant.InternetProtocols]) and [tailcfg.CapGrant] rules (from
@@ -495,6 +511,28 @@ func (pol *Policy) compileOtherDests(
 	srcIPStrings []string,
 ) []tailcfg.FilterRule {
 	var rules []tailcfg.FilterRule
+
+	// Reuse resolutions while keeping the port encoder's partial-error handling
+	// and logging. Wildcards must retain their special port and companion rules.
+	if len(grant.InternetProtocols) > 1 ||
+		(len(grant.InternetProtocols) > 0 && grant.App != nil) {
+		resolvedDests := make(Aliases, len(otherDests))
+		for i, dst := range otherDests {
+			resolvedDests[i] = dst
+			if _, wildcard := dst.(Asterix); wildcard {
+				continue
+			}
+
+			addresses, err := dst.Resolve(pol, users, nodes)
+			resolvedDests[i] = resolvedDestination{
+				Alias:     dst,
+				addresses: addresses,
+				err:       err,
+			}
+		}
+
+		otherDests = resolvedDests
+	}
 
 	// DstPorts rules from InternetProtocols.
 	for _, ipp := range grant.InternetProtocols {
@@ -704,15 +742,54 @@ func compileAutogroupSelf(
 	node types.NodeView,
 	userIdx userNodeIndex,
 ) []tailcfg.FilterRule {
-	if node.IsTagged() || cg.self == nil {
+	if node.IsTagged() || cg.self == nil || !node.User().Valid() {
 		return nil
 	}
 
-	if !node.User().Valid() {
+	return compileSelfForUser(cg, userIdx[node.User().ID()])
+}
+
+// exitNodeSelfRules returns the autogroup:self rules of every user
+// other than the node's own for an exit node, whose exit routes contain
+// every self destination. Only the packet filter needs them: they never
+// make the exit node a peer, and expanding every user for peer matching
+// would cost O(users) per exit node on each peer map build.
+func exitNodeSelfRules(
+	grants []compiledGrant,
+	node types.NodeView,
+	userIdx userNodeIndex,
+) []tailcfg.FilterRule {
+	if !node.IsExitNode() {
 		return nil
 	}
 
-	sameUserNodes := userIdx[node.User().ID()]
+	var rules []tailcfg.FilterRule
+
+	for i := range grants {
+		cg := &grants[i]
+		if cg.self == nil {
+			continue
+		}
+
+		for _, uid := range slices.Sorted(maps.Keys(userIdx)) {
+			// compileAutogroupSelf already covers an untagged node's own user.
+			if !node.IsTagged() && node.User().Valid() && node.User().ID() == uid {
+				continue
+			}
+
+			rules = append(rules, compileSelfForUser(cg, userIdx[uid])...)
+		}
+	}
+
+	return rules
+}
+
+// compileSelfForUser produces the autogroup:self rules for one user's
+// untagged devices.
+func compileSelfForUser(
+	cg *compiledGrant,
+	sameUserNodes []types.NodeView,
+) []tailcfg.FilterRule {
 	if len(sameUserNodes) == 0 {
 		return nil
 	}

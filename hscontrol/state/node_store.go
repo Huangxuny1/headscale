@@ -198,6 +198,9 @@ type work struct {
 	// prober applying multiple probe results at once) cannot have a
 	// partial snapshot published between the updates.
 	multiUpdates map[types.NodeID]UpdateNodeFunc
+	// pre, when non-nil, receives each updated node as it was before its
+	// update function ran.
+	pre map[types.NodeID]types.NodeView
 }
 
 // updateChanges reports whether an in-place update moved a peer-visibility
@@ -210,10 +213,7 @@ func updateChanges(pre, post *types.Node) (bool, bool) {
 		return true, true
 	}
 
-	wasOnline := pre.IsOnline != nil && *pre.IsOnline
-	isOnline := post.IsOnline != nil && *post.IsOnline
-
-	return false, wasOnline != isOnline || pre.Unhealthy != post.Unhealthy
+	return false, pre.Online() != post.Online() || pre.Unhealthy != post.Unhealthy
 }
 
 // PutNode adds or updates a node in the store.
@@ -277,6 +277,27 @@ func (s *NodeStore) UpdateNode(nodeID types.NodeID, updateFn UpdateNodeFunc) (ty
 	return s.GetNode(nodeID)
 }
 
+// UpdateNodeDiff is [NodeStore.UpdateNode] that also returns, first, the node
+// as it was before updateFn ran, so callers can tell what the update changed
+// without cloning the node themselves. That view is invalid when the node does
+// not exist.
+func (s *NodeStore) UpdateNodeDiff(
+	nodeID types.NodeID,
+	updateFn UpdateNodeFunc,
+) (types.NodeView, types.NodeView, bool) {
+	timer := prometheus.NewTimer(nodeStoreOperationDuration.WithLabelValues("update"))
+	defer timer.ObserveDuration()
+
+	pre := make(map[types.NodeID]types.NodeView, 1)
+	s.updateNodes(map[types.NodeID]UpdateNodeFunc{nodeID: updateFn}, pre)
+
+	nodeStoreOperations.WithLabelValues("update").Inc()
+
+	after, ok := s.GetNode(nodeID)
+
+	return pre[nodeID], after, ok
+}
+
 // UpdateNodes applies per-node update functions in a single atomic
 // batch. The election that recomputes primary routes runs once, after
 // every update has landed, so callers cannot observe an intermediate
@@ -285,6 +306,15 @@ func (s *NodeStore) UpdateNode(nodeID types.NodeID, updateFn UpdateNodeFunc) (ty
 // would change the election outcome — e.g. the HA prober applying
 // concurrent probe-timeout results.
 func (s *NodeStore) UpdateNodes(updates map[types.NodeID]UpdateNodeFunc) {
+	s.updateNodes(updates, nil)
+}
+
+// updateNodes queues updates as one batch entry and waits for it, filling pre
+// when it is non-nil.
+func (s *NodeStore) updateNodes(
+	updates map[types.NodeID]UpdateNodeFunc,
+	pre map[types.NodeID]types.NodeView,
+) {
 	timer := prometheus.NewTimer(nodeStoreOperationDuration.WithLabelValues("update_multi"))
 	defer timer.ObserveDuration()
 
@@ -295,6 +325,7 @@ func (s *NodeStore) UpdateNodes(updates map[types.NodeID]UpdateNodeFunc) {
 	w := work{
 		op:           updateMulti,
 		multiUpdates: updates,
+		pre:          pre,
 		result:       make(chan struct{}),
 	}
 
@@ -510,6 +541,10 @@ func (s *NodeStore) applyBatch(batch []work) {
 
 				nodes[id] = n
 
+				if w.pre != nil {
+					w.pre[id] = pre.View()
+				}
+
 				relation, election := updateChanges(pre, &n)
 				relationChanged = relationChanged || relation
 				electionChanged = electionChanged || election
@@ -541,8 +576,9 @@ func (s *NodeStore) applyBatch(batch []work) {
 
 			taken := false
 
+			// DNS is case-insensitive: a legacy "Laptop" already holds "laptop".
 			for id, other := range nodes {
-				if id != w.nodeID && other.GivenName == w.name {
+				if id != w.nodeID && strings.EqualFold(other.GivenName, w.name) {
 					taken = true
 					break
 				}
@@ -641,12 +677,13 @@ func resolveGivenName(nodes map[types.NodeID]types.Node, self types.NodeID, base
 			continue
 		}
 
-		taken[n.GivenName] = struct{}{}
+		// DNS is case-insensitive: a legacy "Laptop" already holds "laptop".
+		taken[strings.ToLower(n.GivenName)] = struct{}{}
 	}
 
 	candidate := base
 	for i := 1; ; i++ {
-		if _, busy := taken[candidate]; !busy {
+		if _, busy := taken[strings.ToLower(candidate)]; !busy {
 			return candidate
 		}
 
@@ -976,6 +1013,12 @@ func (s *NodeStore) ListPeers(id types.NodeID) views.Slice[types.NodeView] {
 	return views.SliceOf(peers)
 }
 
+// ListPeerIDs returns the sorted IDs of id's peers as a copy the caller
+// may keep across later writes.
+func (s *NodeStore) ListPeerIDs(id types.NodeID) []types.NodeID {
+	return slices.Sorted(slices.Values(s.data.Load().peersByNode[id]))
+}
+
 // PrimaryRouteFor returns the current primary advertiser for prefix.
 func (s *NodeStore) PrimaryRouteFor(prefix netip.Prefix) (types.NodeID, bool) {
 	id, ok := s.data.Load().routes[prefix]
@@ -983,7 +1026,7 @@ func (s *NodeStore) PrimaryRouteFor(prefix netip.Prefix) (types.NodeID, bool) {
 }
 
 // PrimaryRoutesForNode returns the prefixes for which id is the current
-// primary advertiser.
+// primary advertiser, sorted so an unchanged node renders identically.
 func (s *NodeStore) PrimaryRoutesForNode(id types.NodeID) []netip.Prefix {
 	snap := s.data.Load()
 	if !snap.isPrimaryRoute[id] {
@@ -997,6 +1040,8 @@ func (s *NodeStore) PrimaryRoutesForNode(id types.NodeID) []netip.Prefix {
 			out = append(out, prefix)
 		}
 	}
+
+	slices.SortFunc(out, netip.Prefix.Compare)
 
 	return out
 }

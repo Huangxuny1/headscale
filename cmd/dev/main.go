@@ -61,15 +61,14 @@ dns:
   magic_dns: true
   base_domain: headscale.dev
   override_local_dns: false
-cert:
-  enabled: false
-  dns_provider:
-    # Provider name. Currently supported: "cloudflare"
-    # Future: "route53", "gcloud", "rfc2136", etc.
-    name: "cloudflare"
-    # Provider-specific configuration (key-value pairs).
-    config:
-      api_token: "123"
+  certificates:
+    enabled: false
+    # zone: headscale.dev
+  # challenge:
+  #   provider:
+  #     name: cloudflare
+  #     api_token: "123"
+
 log:
   level: debug
   format: text

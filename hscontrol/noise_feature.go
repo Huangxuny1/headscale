@@ -50,7 +50,7 @@ func (ns *noiseServer) QueryFeatureHandler(writer http.ResponseWriter, req *http
 func (ns *noiseServer) resolveFeatureQuery(feature string) tailcfg.QueryFeatureResponse {
 	switch feature {
 	case "serve":
-		if ns.headscale.cfg.Cert.Enabled {
+		if ns.headscale.cfg.DNSConfig.Certificates.Enabled {
 			return tailcfg.QueryFeatureResponse{
 				Complete: true,
 			}
@@ -58,7 +58,7 @@ func (ns *noiseServer) resolveFeatureQuery(feature string) tailcfg.QueryFeatureR
 
 		return tailcfg.QueryFeatureResponse{
 			Text: "tailscale serve requires certificate support to be enabled.\n" +
-				"Ask your Headscale administrator to set cert.enabled = true in the server configuration.",
+				"Ask your Headscale administrator to set dns.certificates.enabled = true in the server configuration.",
 		}
 
 	case "funnel":

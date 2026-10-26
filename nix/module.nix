@@ -1,7 +1,8 @@
-{ config
-, lib
-, pkgs
-, ...
+{
+  config,
+  lib,
+  pkgs,
+  ...
 }:
 let
   cfg = config.services.headscale;
@@ -202,16 +203,6 @@ in
               };
             };
 
-            ephemeral_node_inactivity_timeout = lib.mkOption {
-              type = lib.types.str;
-              default = "30m";
-              description = ''
-                Time before an inactive ephemeral node is deleted.
-                Deprecated: use node.ephemeral.inactivity_timeout instead.
-              '';
-              example = "5m";
-            };
-
             node = {
               expiry = lib.mkOption {
                 type = lib.types.str;
@@ -373,17 +364,17 @@ in
                     List of nameservers to pass to Tailscale clients.
                   '';
                 };
-              };
 
-              split = lib.mkOption {
-                type = lib.types.attrsOf (lib.types.listOf lib.types.str);
-                default = { };
-                description = ''
-                  Split DNS configuration (map of domains and which DNS server to use for each).
-                  See <https://tailscale.com/docs/reference/dns-in-tailscale>.
-                '';
-                example = {
-                  "foo.bar.com" = [ "1.1.1.1" ];
+                split = lib.mkOption {
+                  type = lib.types.attrsOf (lib.types.listOf lib.types.str);
+                  default = { };
+                  description = ''
+                    Split DNS configuration (map of domains and which DNS server to use for each).
+                    See <https://tailscale.com/docs/reference/dns-in-tailscale>.
+                  '';
+                  example = {
+                    "foo.bar.com" = [ "1.1.1.1" ];
+                  };
                 };
               };
 
@@ -434,6 +425,55 @@ in
                   Search domains to inject to Tailscale clients.
                 '';
                 example = [ "mydomain.internal" ];
+              };
+
+              certificates = {
+                enabled = lib.mkOption {
+                  type = lib.types.bool;
+                  default = false;
+                  description = ''
+                    Whether nodes can get TLS certificates for their MagicDNS name
+                    with `tailscale cert`. Needs a public {option}`base_domain` and
+                    {option}`dns.challenge.provider`.
+                  '';
+                };
+
+                zone = lib.mkOption {
+                  type = lib.types.str;
+                  default = "";
+                  description = ''
+                    DNS zone the challenge records are written to. Empty means
+                    {option}`base_domain`.
+                  '';
+                  example = "example.com";
+                };
+              };
+
+              challenge.provider = lib.mkOption {
+                type = lib.types.nullOr (
+                  lib.types.submodule {
+                    freeformType = settingsFormat.type;
+                    options.name = lib.mkOption {
+                      type = lib.types.str;
+                      description = ''
+                        DNS provider that writes ACME DNS-01 challenge records:
+                        acmedns, cloudflare, gigahost, hetzner, powerdns or rfc2136.
+                      '';
+                    };
+                  }
+                );
+                default = null;
+                description = ''
+                  DNS provider for ACME DNS-01 challenges. Every key besides
+                  `name` is a setting of the provider; a text setting can be read
+                  from a file by adding `_path` to its name.
+                '';
+                example = lib.literalExpression ''
+                  {
+                    name = "cloudflare";
+                    api_token_path = "''${CREDENTIALS_DIRECTORY}/cloudflare-token";
+                  }
+                '';
               };
             };
 
@@ -531,50 +571,60 @@ in
               };
             };
 
-            tls_letsencrypt_hostname = lib.mkOption {
-              type = lib.types.nullOr lib.types.str;
-              default = "";
-              description = ''
-                Domain name to request a TLS certificate for.
-              '';
-            };
+            tls = {
+              cert_path = lib.mkOption {
+                type = lib.types.nullOr lib.types.path;
+                default = null;
+                description = ''
+                  Path to already created certificate.
+                '';
+              };
 
-            tls_letsencrypt_challenge_type = lib.mkOption {
-              type = lib.types.enum [
-                "TLS-ALPN-01"
-                "HTTP-01"
-              ];
-              default = "HTTP-01";
-              description = ''
-                Type of ACME challenge to use, currently supported types:
-                `HTTP-01` or `TLS-ALPN-01`.
-              '';
-            };
+              key_path = lib.mkOption {
+                type = lib.types.nullOr lib.types.path;
+                default = null;
+                description = ''
+                  Path to key for already created certificate.
+                '';
+              };
 
-            tls_letsencrypt_listen = lib.mkOption {
-              type = lib.types.nullOr lib.types.str;
-              default = ":http";
-              description = ''
-                When HTTP-01 challenge is chosen, letsencrypt must set up a
-                verification endpoint, and it will be listening on:
-                `:http = port 80`.
-              '';
-            };
+              acme = {
+                hostname = lib.mkOption {
+                  type = lib.types.str;
+                  default = "";
+                  description = ''
+                    Domain name to request a TLS certificate for.
+                  '';
+                };
 
-            tls_cert_path = lib.mkOption {
-              type = lib.types.nullOr lib.types.path;
-              default = null;
-              description = ''
-                Path to already created certificate.
-              '';
-            };
+                # Defaults are null so headscale falls back to the flat
+                # tls_letsencrypt_* keys still set in older configurations.
+                challenge_type = lib.mkOption {
+                  type = lib.types.nullOr (
+                    lib.types.enum [
+                      "TLS-ALPN-01"
+                      "HTTP-01"
+                      "DNS-01"
+                    ]
+                  );
+                  default = null;
+                  description = ''
+                    Type of ACME challenge to use: `HTTP-01` (default),
+                    `TLS-ALPN-01`, or `DNS-01` through
+                    {option}`dns.challenge.provider`.
+                  '';
+                };
 
-            tls_key_path = lib.mkOption {
-              type = lib.types.nullOr lib.types.path;
-              default = null;
-              description = ''
-                Path to key for already created certificate.
-              '';
+                http_listen = lib.mkOption {
+                  type = lib.types.nullOr lib.types.str;
+                  default = null;
+                  description = ''
+                    When HTTP-01 challenge is chosen, letsencrypt must set up a
+                    verification endpoint, and it will be listening on:
+                    `:http = port 80` (default).
+                  '';
+                };
+              };
             };
 
             policy = {
@@ -628,7 +678,7 @@ in
     )
     (mkRenamedOptionModule
       [ "services" "headscale" "ephemeralNodeInactivityTimeout" ]
-      [ "services" "headscale" "settings" "ephemeral_node_inactivity_timeout" ]
+      [ "services" "headscale" "settings" "node" "ephemeral" "inactivity_timeout" ]
     )
     (mkRenamedOptionModule
       [ "services" "headscale" "logLevel" ]
@@ -652,23 +702,23 @@ in
     )
     (mkRenamedOptionModule
       [ "services" "headscale" "tls" "certFile" ]
-      [ "services" "headscale" "settings" "tls_cert_path" ]
+      [ "services" "headscale" "settings" "tls" "cert_path" ]
     )
     (mkRenamedOptionModule
       [ "services" "headscale" "tls" "keyFile" ]
-      [ "services" "headscale" "settings" "tls_key_path" ]
+      [ "services" "headscale" "settings" "tls" "key_path" ]
     )
     (mkRenamedOptionModule
       [ "services" "headscale" "tls" "letsencrypt" "challengeType" ]
-      [ "services" "headscale" "settings" "tls_letsencrypt_challenge_type" ]
+      [ "services" "headscale" "settings" "tls" "acme" "challenge_type" ]
     )
     (mkRenamedOptionModule
       [ "services" "headscale" "tls" "letsencrypt" "hostname" ]
-      [ "services" "headscale" "settings" "tls_letsencrypt_hostname" ]
+      [ "services" "headscale" "settings" "tls" "acme" "hostname" ]
     )
     (mkRenamedOptionModule
       [ "services" "headscale" "tls" "letsencrypt" "httpListen" ]
-      [ "services" "headscale" "settings" "tls_letsencrypt_listen" ]
+      [ "services" "headscale" "settings" "tls" "acme" "http_listen" ]
     )
 
     (mkRemovedOptionModule [ "services" "headscale" "openIdConnect" "domainMap" ] ''
@@ -686,6 +736,19 @@ in
         assertion = with cfg.settings; dns.override_local_dns -> dns.nameservers.global != [ ];
         message = "dns.nameservers.global must be set when overriding local DNS";
       }
+      {
+        assertion =
+          with cfg.settings;
+          dns.certificates.enabled
+          -> dns.magic_dns && dns.base_domain != "" && dns.challenge.provider != null;
+        message = "dns.certificates.enabled needs dns.magic_dns, dns.base_domain and dns.challenge.provider";
+      }
+      {
+        assertion =
+          with cfg.settings.tls.acme;
+          hostname != "" && challenge_type == "DNS-01" -> cfg.settings.dns.challenge.provider != null;
+        message = "tls.acme.challenge_type DNS-01 needs dns.challenge.provider";
+      }
       (assertRemovedOption [ "settings" "acl_policy_path" ] "Use `policy.path` instead.")
       (assertRemovedOption [ "settings" "db_host" ] "Use `database.postgres.host` instead.")
       (assertRemovedOption [ "settings" "db_name" ] "Use `database.postgres.name` instead.")
@@ -697,6 +760,7 @@ in
       (assertRemovedOption [ "settings" "db_port" ] "Use `database.postgres.port` instead.")
       (assertRemovedOption [ "settings" "db_type" ] "Use `database.type` instead.")
       (assertRemovedOption [ "settings" "db_user" ] "Use `database.postgres.user` instead.")
+      (assertRemovedOption [ "settings" "dns" "split" ] "Use `dns.nameservers.split` instead.")
       (assertRemovedOption [ "settings" "dns_config" ] "Use `dns` instead.")
       (assertRemovedOption [ "settings" "dns_config" "domains" ] "Use `dns.search_domains` instead.")
       (assertRemovedOption [
@@ -709,14 +773,16 @@ in
         "oidc"
         "strip_email_domain"
       ] "The strip_email_domain option got removed upstream")
+      (assertRemovedOption [
+        "settings"
+        "ephemeral_node_inactivity_timeout"
+      ] "Use `node.ephemeral.inactivity_timeout` instead.")
     ];
 
     services.headscale.settings = lib.mkMerge [
       cliConfig
       {
         listen_addr = lib.mkDefault "${cfg.address}:${toString cfg.port}";
-
-        tls_letsencrypt_cache_dir = "${dataDir}/.cache";
       }
     ];
 

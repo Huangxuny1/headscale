@@ -3,13 +3,19 @@ package types
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	hsdns "github.com/juanfont/headscale/hscontrol/dns"
+	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/libdns/cloudflare"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -58,6 +64,7 @@ func TestReadConfig(t *testing.T) {
 					{Name: "prometheus.myvpn.example.com", Type: "A", Value: "100.64.0.4"},
 				},
 				SearchDomains: []string{"test.com", "bar.com"},
+				Certificates:  CertificatesConfig{Zone: "example.com"},
 			},
 		},
 		{
@@ -124,6 +131,7 @@ func TestReadConfig(t *testing.T) {
 					{Name: "prometheus.myvpn.example.com", Type: "A", Value: "100.64.0.4"},
 				},
 				SearchDomains: []string{"test.com", "bar.com"},
+				Certificates:  CertificatesConfig{Zone: "example.com"},
 			},
 		},
 		{
@@ -164,7 +172,7 @@ func TestReadConfig(t *testing.T) {
 				return LoadServerConfig()
 			},
 			want:    nil,
-			wantErr: errServerURLSuffix.Error(),
+			wantErr: "server_url is a subdomain of dns.base_domain",
 		},
 		{
 			name:       "base-domain-not-in-server-url",
@@ -192,7 +200,7 @@ func TestReadConfig(t *testing.T) {
 			setup: func(t *testing.T) (any, error) { //nolint:thelper
 				return LoadServerConfig()
 			},
-			wantErr: "Fatal config error: dns.nameservers.global must be set when dns.override_local_dns is true",
+			wantErr: "Fatal config error: dns.nameservers.global is required when dns.override_local_dns is true",
 		},
 		{
 			name:       "dns-override-true",
@@ -251,7 +259,8 @@ func TestReadConfig(t *testing.T) {
 			conf, err := tt.setup(t)
 
 			if tt.wantErr != "" {
-				assert.Equal(t, tt.wantErr, err.Error())
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
 
 				return
 			}
@@ -327,6 +336,7 @@ func TestReadConfigFromEnv(t *testing.T) {
 				// 	{Name: "prometheus.myvpn.example.com", Type: "A", Value: "100.64.0.4"},
 				// },
 				SearchDomains: []string{"test.com", "bar.com"},
+				Certificates:  CertificatesConfig{Zone: "example.com"},
 			},
 		},
 	}
@@ -358,9 +368,11 @@ func TestTLSConfigValidation(t *testing.T) {
 	var err error
 
 	configYaml := []byte(`---
-tls_letsencrypt_hostname: example.com
-tls_letsencrypt_challenge_type: ""
-tls_cert_path: abc.pem
+tls:
+  cert_path: abc.pem
+  acme:
+    hostname: example.com
+    challenge_type: bogus
 noise:
   private_key_path: noise_private.key`)
 
@@ -381,17 +393,17 @@ noise:
 	assert.Contains(
 		t,
 		err.Error(),
-		"Fatal config error: set either tls_letsencrypt_hostname or tls_cert_path/tls_key_path, not both",
+		"Fatal config error: tls.acme.hostname and tls.cert_path/tls.key_path are mutually exclusive",
 	)
 	assert.Contains(
 		t,
 		err.Error(),
-		"Fatal config error: the only supported values for tls_letsencrypt_challenge_type are",
+		"Fatal config error: tls.acme.challenge_type has an unsupported value",
 	)
 	assert.Contains(
 		t,
 		err.Error(),
-		"Fatal config error: server_url must start with https:// or http://",
+		"Fatal config error: server_url is missing a scheme",
 	)
 
 	// Check configuration validation errors (2)
@@ -399,8 +411,10 @@ noise:
 noise:
   private_key_path: noise_private.key
 server_url: http://127.0.0.1:8080
-tls_letsencrypt_hostname: example.com
-tls_letsencrypt_challenge_type: TLS-ALPN-01
+tls:
+  acme:
+    hostname: example.com
+    challenge_type: TLS-ALPN-01
 `)
 
 	err = os.WriteFile(configFilePath, configYaml, 0o600)
@@ -492,7 +506,10 @@ noise:
   private_key_path: noise_private.key
 server_url: http://127.0.0.1:8080
 dns:
+  magic_dns: false
   override_local_dns: false
+database:
+  type: sqlite
 oidc:` + tt.oidcBlock + "\n")
 
 			require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "config.yaml"), configYaml, 0o600))
@@ -507,6 +524,258 @@ oidc:` + tt.oidcBlock + "\n")
 
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestTLSACMEListenAddrCollision(t *testing.T) {
+	const (
+		tlsKeys = `tls:
+  acme:
+    hostname: %q
+    challenge_type: %q
+    http_listen: %q
+`
+		legacyKeys = `tls_letsencrypt_hostname: %q
+tls_letsencrypt_challenge_type: %q
+tls_letsencrypt_listen: %q
+`
+	)
+
+	tests := []struct {
+		name          string
+		listenAddr    string
+		acmeListen    string
+		hostname      string
+		challengeType string
+		keys          string
+		wantErr       string // empty = expect no error
+	}{
+		{"collision-numeric", ":80", ":80", "example.com", "HTTP-01", tlsKeys, "would bind the same TCP socket"},
+		{"collision-named-vs-numeric", "0.0.0.0:80", ":http", "example.com", "HTTP-01", tlsKeys, "would bind the same TCP socket"},
+		{"collision-https-named", ":443", ":https", "example.com", "HTTP-01", tlsKeys, "would bind the same TCP socket"},
+		{"collision-legacy-keys", ":80", ":80", "example.com", "HTTP-01", legacyKeys, "would bind the same TCP socket"},
+		{"canonical", "0.0.0.0:443", ":http", "example.com", "HTTP-01", tlsKeys, ""},
+		{"no-hostname-skipped", "0.0.0.0:80", ":http", "", "HTTP-01", tlsKeys, ""},
+		{"tls-alpn-01-skipped", "0.0.0.0:80", ":http", "example.com", "TLS-ALPN-01", tlsKeys, ""},
+		{"different-numeric", ":8080", ":8081", "example.com", "HTTP-01", tlsKeys, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			viper.Reset()
+
+			tmpDir := t.TempDir()
+			cfg := fmt.Sprintf(`---
+server_url: https://example.com
+listen_addr: %q
+`+tt.keys+`noise:
+  private_key_path: noise_private.key
+database:
+  type: sqlite3
+dns:
+  magic_dns: false
+  override_local_dns: false
+`, tt.listenAddr, tt.hostname, tt.challengeType, tt.acmeListen)
+			require.NoError(t, os.WriteFile(
+				filepath.Join(tmpDir, "config.yaml"), []byte(cfg), 0o600))
+			require.NoError(t, LoadConfig(tmpDir, false))
+
+			err := validateServerConfig()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestLoadServerConfig_CollectsAcrossSubBuilders(t *testing.T) {
+	viper.Reset()
+
+	tmpDir := t.TempDir()
+	cfg := `---
+server_url: https://example.com
+listen_addr: 0.0.0.0:8080
+prefixes:
+  v4: not-a-cidr
+  v6: also-not-a-cidr
+  allocation: bogus
+oidc:
+  client_secret: hunter2
+  client_secret_path: /nonexistent/secret
+noise:
+  private_key_path: noise_private.key
+database:
+  type: sqlite3
+dns:
+  magic_dns: false
+  override_local_dns: false
+  base_domain: example.com
+`
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tmpDir, "config.yaml"), []byte(cfg), 0o600))
+	require.NoError(t, LoadConfig(tmpDir, false))
+
+	_, err := LoadServerConfig()
+	require.Error(t, err)
+
+	got := ConfigErrors(err)
+	assert.GreaterOrEqual(t, len(got), 4,
+		"expected sub-builder errors collected into one report; got %d: %v",
+		len(got), reasons(got))
+
+	// Sentinels stay reachable through ConfigError.Cause.
+	require.ErrorIs(t, err, ErrInvalidAllocationStrategy,
+		"wrapped ErrInvalidAllocationStrategy not in chain")
+	require.ErrorIs(t, err, errOidcMutuallyExclusive,
+		"wrapped errOidcMutuallyExclusive not in chain")
+
+	// Each sub-builder failure surfaces its YAML key in the rendered output.
+	rendered := err.Error()
+	for _, want := range []string{
+		"prefixes.v4",
+		"prefixes.v6",
+		"prefixes.allocation",
+		"oidc.client_secret",
+	} {
+		assert.Contains(t, rendered, want,
+			"expected rendered error to mention %q", want)
+	}
+}
+
+func reasons(errs []*ConfigError) []string {
+	out := make([]string, len(errs))
+	for i, e := range errs {
+		out[i] = e.Reason
+	}
+
+	return out
+}
+
+func TestDeprecatedKeysFlowThroughValidator(t *testing.T) {
+	viper.Reset()
+
+	tmpDir := t.TempDir()
+	cfg := `---
+server_url: https://example.com
+listen_addr: 0.0.0.0:8080
+oidc:
+  expiry: 1h
+dns_config:
+  use_username_in_magic_dns: true
+noise:
+  private_key_path: noise_private.key
+database:
+  type: sqlite3
+dns:
+  magic_dns: false
+  override_local_dns: false
+`
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tmpDir, "config.yaml"), []byte(cfg), 0o600))
+	require.NoError(t, LoadConfig(tmpDir, false))
+
+	err := validateServerConfig()
+	require.Error(t, err)
+
+	got := ConfigErrors(err)
+	require.GreaterOrEqual(t, len(got), 2,
+		"expected fatal deprecated keys to surface as ConfigErrors; got %d", len(got))
+
+	reasons := make([]string, 0, len(got))
+	for _, ce := range got {
+		reasons = append(reasons, ce.Reason)
+	}
+
+	wantSubstrs := []string{"oidc.expiry", "dns_config.use_username_in_magic_dns"}
+	for _, want := range wantSubstrs {
+		var found bool
+
+		for _, r := range reasons {
+			if strings.Contains(r, want) {
+				found = true
+				break
+			}
+		}
+
+		assert.True(t, found, "expected ConfigError mentioning %q in reasons %v", want, reasons)
+	}
+}
+
+// The unset case is the regression: the default is spelled "0o770", which a
+// base-8 parse rejects, so the socket silently became 0700.
+// https://github.com/juanfont/headscale/issues/3529
+func TestUnixSocketPermission(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		env     string
+		want    fs.FileMode
+		wantErr bool
+	}{
+		{name: "unset-uses-default", want: 0o770},
+		{name: "null-uses-default", yaml: `unix_socket_permission: null`, want: 0o770},
+		{name: "quoted-leading-zero", yaml: `unix_socket_permission: "0770"`, want: 0o770},
+		{name: "quoted-plain", yaml: `unix_socket_permission: "770"`, want: 0o770},
+		{name: "quoted-0o-prefix", yaml: `unix_socket_permission: "0o770"`, want: 0o770},
+		{name: "quoted-0o-prefix-owner-only", yaml: `unix_socket_permission: "0o700"`, want: 0o700},
+		{name: "quoted-zero", yaml: `unix_socket_permission: "0000"`, want: 0},
+		{name: "env", env: "0660", want: 0o660},
+		{name: "env-0o-prefix", env: "0o660", want: 0o660},
+		{name: "env-overrides-file", yaml: `unix_socket_permission: "0770"`, env: "0700", want: 0o700},
+		{name: "env-invalid-is-error", env: "bogus", wantErr: true},
+		{name: "empty-is-error", yaml: `unix_socket_permission: ""`, wantErr: true},
+		{name: "symbolic-is-error", yaml: `unix_socket_permission: "rwxrwx---"`, wantErr: true},
+		{name: "special-bits-are-error", yaml: `unix_socket_permission: "1770"`, wantErr: true},
+		{name: "out-of-range-is-error", yaml: `unix_socket_permission: "17777"`, wantErr: true},
+		// YAML reads unquoted 0770 as int 504, indistinguishable from a literal 504.
+		{name: "unquoted-leading-zero-is-error", yaml: `unix_socket_permission: 0770`, wantErr: true},
+		{name: "unquoted-0o-prefix-is-error", yaml: `unix_socket_permission: 0o770`, wantErr: true},
+		{name: "unquoted-plain-is-error", yaml: `unix_socket_permission: 770`, wantErr: true},
+		{name: "float-is-error", yaml: `unix_socket_permission: 770.0`, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			viper.Reset()
+
+			if tt.env != "" {
+				t.Setenv("HEADSCALE_UNIX_SOCKET_PERMISSION", tt.env)
+			}
+
+			tmpDir := t.TempDir()
+			cfg := `---
+server_url: https://example.com
+listen_addr: 0.0.0.0:8080
+prefixes:
+  v4: 100.64.0.0/10
+noise:
+  private_key_path: noise_private.key
+database:
+  type: sqlite3
+dns:
+  magic_dns: false
+  override_local_dns: false
+` + tt.yaml + "\n"
+			require.NoError(t, os.WriteFile(
+				filepath.Join(tmpDir, "config.yaml"), []byte(cfg), 0o600))
+			require.NoError(t, LoadConfig(tmpDir, false))
+
+			got, err := LoadServerConfig()
+			if tt.wantErr {
+				require.ErrorIs(t, err, util.ErrInvalidFileMode,
+					"invalid unix_socket_permission must not silently fall back")
+				assert.Contains(t, err.Error(), "unix_socket_permission")
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got.UnixSocketPermission,
+				"got %#o, want %#o", got.UnixSocketPermission, tt.want)
 		})
 	}
 }
@@ -626,6 +895,7 @@ func TestConfigJSONOmitsSecrets(t *testing.T) {
 		secretPostgresPass = "p0stgres-secret-marker"
 		secretClientSecret = "oidc-client-secret-marker"    //nolint:gosec // test marker, not a real credential
 		secretAPIKey       = "headscale-cli-api-key-marker" //nolint:gosec // test marker, not a real credential
+		secretDNSToken     = "dns-provider-token-marker"    //nolint:gosec // test marker, not a real credential
 	)
 
 	cfg := &Config{
@@ -640,13 +910,17 @@ func TestConfigJSONOmitsSecrets(t *testing.T) {
 		CLI: CLIConfig{
 			APIKey: secretAPIKey,
 		},
+		DNSChallenge: DNSChallengeConfig{
+			ProviderName: "cloudflare",
+			Provider:     &cloudflare.Provider{APIToken: secretDNSToken},
+		},
 	}
 
 	out, err := json.Marshal(cfg)
 	require.NoError(t, err)
 
 	body := string(out)
-	for _, secret := range []string{secretPostgresPass, secretClientSecret, secretAPIKey} {
+	for _, secret := range []string{secretPostgresPass, secretClientSecret, secretAPIKey, secretDNSToken} {
 		assert.NotContains(t, body, secret,
 			"marshalled Config must not contain secret %q", secret)
 	}
@@ -768,5 +1042,534 @@ func TestExtraRecordsAreLowercased(t *testing.T) {
 
 	if diff := cmp.Diff(want, cfg.TailcfgDNSConfig.ExtraRecords); diff != "" {
 		t.Errorf("SetExtraRecords mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestDNSChallengeConfig(t *testing.T) {
+	secret := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(secret, []byte("file-token\n"), 0o600))
+
+	base := `---
+server_url: https://headscale.example.com
+noise:
+  private_key_path: noise_private.key
+prefixes:
+  v4: 100.64.0.0/10
+database:
+  type: sqlite
+dns:
+  magic_dns: true
+  override_local_dns: false
+  base_domain: ts.example.com
+`
+
+	tests := []struct {
+		name          string
+		yaml          string
+		env           map[string]string
+		wantErr       string
+		wantZone      string
+		wantToken     string
+		wantNoProv    bool
+		wantResolvers []string
+		wantIsolates  string
+	}{
+		{
+			name: "disabled by default",
+			yaml: base,
+			// Zone follows base_domain even when unused, so it is never empty.
+			wantZone:      "ts.example.com",
+			wantNoProv:    true,
+			wantResolvers: []string{"1.1.1.1:53", "8.8.8.8:53"},
+		},
+		{
+			name: "resolvers default to port 53",
+			yaml: base + `  challenge:
+    resolvers: ["9.9.9.9", "2620:fe::fe", "127.0.0.1:5353"]
+`,
+			wantZone:      "ts.example.com",
+			wantNoProv:    true,
+			wantResolvers: []string{"9.9.9.9:53", "[2620:fe::fe]:53", "127.0.0.1:5353"},
+		},
+		{
+			name: "enabled with inline token",
+			yaml: base + `  certificates:
+    enabled: true
+  challenge:
+    provider:
+      name: cloudflare
+      api_token: yaml-token
+`,
+			wantZone:  "ts.example.com",
+			wantToken: "yaml-token",
+		},
+		{
+			name: "env only",
+			yaml: base,
+			env: map[string]string{
+				"HEADSCALE_DNS_CERTIFICATES_ENABLED":              "true",
+				"HEADSCALE_DNS_CERTIFICATES_ZONE":                 "example.com",
+				"HEADSCALE_DNS_CHALLENGE_PROVIDER_NAME":           "cloudflare",
+				"HEADSCALE_DNS_CHALLENGE_PROVIDER_API_TOKEN_PATH": secret,
+			},
+			wantZone:  "example.com",
+			wantToken: "file-token",
+		},
+		{
+			name: "env overrides yaml",
+			yaml: base + `  challenge:
+    provider:
+      name: cloudflare
+      api_token: yaml-token
+`,
+			env:       map[string]string{"HEADSCALE_DNS_CHALLENGE_PROVIDER_API_TOKEN": "env-token"},
+			wantZone:  "ts.example.com",
+			wantToken: "env-token",
+		},
+		{
+			name: "typo in provider key",
+			yaml: base + `  challenge:
+    provider:
+      name: cloudflare
+      auth_token: tok
+`,
+			wantErr: "dns.challenge.provider is invalid",
+		},
+		{
+			name: "unknown provider",
+			yaml: base + `  challenge:
+    provider:
+      name: route53
+`,
+			wantErr: "dns.challenge.provider is invalid",
+		},
+		{
+			name: "acmedns one account for node certificates",
+			yaml: base + `  certificates:
+    enabled: true
+  challenge:
+    provider:
+      name: acmedns
+      username: user
+      password: pass
+      subdomain: reg
+      server_url: https://auth.acme-dns.io
+`,
+			wantErr: "registration per name",
+		},
+		{
+			name: "acmedns registration per name",
+			yaml: base + `  certificates:
+    enabled: true
+  challenge:
+    provider:
+      name: acmedns
+      config:
+        laptop.ts.example.com:
+          username: user
+          password: pass
+          subdomain: reg-laptop
+          server_url: https://auth.acme-dns.io
+        desktop.ts.example.com:
+          username: user
+          password: pass
+          subdomain: reg-desktop
+          server_url: https://auth.acme-dns.io
+`,
+			wantZone:     "ts.example.com",
+			wantIsolates: "laptop.ts.example.com",
+		},
+		{
+			name: "acmedns registration shared by node names",
+			yaml: base + `  certificates:
+    enabled: true
+  challenge:
+    provider:
+      name: acmedns
+      config:
+        laptop.ts.example.com:
+          username: user
+          password: pass
+          subdomain: reg
+          server_url: https://auth.acme-dns.io
+        desktop.ts.example.com:
+          username: user
+          password: pass
+          subdomain: reg
+          server_url: https://auth.acme-dns.io
+`,
+			wantErr: "desktop.ts.example.com and laptop.ts.example.com share registration reg",
+		},
+		{
+			name: "acmedns one account for headscale's own certificate",
+			yaml: base + `  challenge:
+    provider:
+      name: acmedns
+      username: user
+      password: pass
+      subdomain: reg
+      server_url: https://auth.acme-dns.io
+tls:
+  acme:
+    hostname: headscale.example.com
+    challenge_type: DNS-01
+`,
+			wantZone: "ts.example.com",
+		},
+		{
+			name: "acmedns registration shared with headscale's own name",
+			yaml: base + `  certificates:
+    enabled: true
+  challenge:
+    provider:
+      name: acmedns
+      config:
+        laptop.ts.example.com:
+          username: user
+          password: pass
+          subdomain: reg
+          server_url: https://auth.acme-dns.io
+        headscale.example.com:
+          username: user
+          password: pass
+          subdomain: reg
+          server_url: https://auth.acme-dns.io
+tls:
+  acme:
+    hostname: headscale.example.com
+    challenge_type: DNS-01
+`,
+			wantErr: "headscale.example.com and laptop.ts.example.com share registration reg",
+		},
+		{
+			name: "enabled without magic dns",
+			yaml: strings.Replace(base, "magic_dns: true", "magic_dns: false", 1) + `  certificates:
+    enabled: true
+  challenge:
+    provider:
+      name: cloudflare
+      api_token: tok
+`,
+			wantErr: "dns.certificates requires dns.magic_dns",
+		},
+		{
+			name: "enabled without provider",
+			yaml: base + `  certificates:
+    enabled: true
+`,
+			wantErr: "dns.certificates and tls.acme DNS-01 require dns.challenge.provider",
+		},
+		{
+			name: "base_domain outside zone",
+			yaml: base + `  certificates:
+    enabled: true
+    zone: notexample.com
+  challenge:
+    provider:
+      name: cloudflare
+      api_token: tok
+`,
+			wantErr: "dns.base_domain is not inside dns.certificates.zone",
+		},
+		{
+			name: "zone suffix without label boundary",
+			yaml: base + `  certificates:
+    enabled: true
+    zone: ample.com
+  challenge:
+    provider:
+      name: cloudflare
+      api_token: tok
+`,
+			wantErr: "dns.base_domain is not inside dns.certificates.zone",
+		},
+		{
+			name: "uppercase base_domain",
+			yaml: strings.Replace(base, "ts.example.com", "TS.example.com", 1) + `  certificates:
+    enabled: true
+  challenge:
+    provider:
+      name: cloudflare
+      api_token: tok
+`,
+			wantErr: "dns.base_domain must be a lowercase DNS name",
+		},
+		{
+			name: "tls DNS-01 without provider",
+			yaml: base + `tls:
+  acme:
+    hostname: headscale.example.com
+    challenge_type: DNS-01
+`,
+			wantErr: "dns.certificates and tls.acme DNS-01 require dns.challenge.provider",
+		},
+		{
+			name: "negative propagation timeout",
+			yaml: base + `  challenge:
+    propagation_timeout: -1s
+`,
+			wantErr: "dns.challenge.propagation_timeout must not be negative",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			viper.Reset()
+
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			tmpDir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(tt.yaml), 0o600))
+			require.NoError(t, LoadConfig(tmpDir, false))
+
+			cfg, err := LoadServerConfig()
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantZone, cfg.DNSConfig.Certificates.Zone)
+
+			if tt.wantResolvers != nil {
+				assert.Equal(t, tt.wantResolvers, cfg.DNSChallenge.Resolvers)
+			}
+
+			if tt.wantNoProv {
+				assert.Nil(t, cfg.DNSChallenge.Provider)
+
+				return
+			}
+
+			if iso, ok := cfg.DNSChallenge.Provider.(hsdns.Isolator); ok {
+				if tt.wantIsolates != "" {
+					assert.True(t, iso.Isolates(tt.wantIsolates))
+				}
+
+				return
+			}
+
+			provider, ok := cfg.DNSChallenge.Provider.(*cloudflare.Provider)
+			require.True(t, ok, "provider is %T", cfg.DNSChallenge.Provider)
+			assert.Equal(t, tt.wantToken, provider.APIToken)
+		})
+	}
+}
+
+// TestTLSLegacyKeys pins that the flat TLS keys keep working under the tls
+// block, with the tls keys winning, and that the NixOS module's defaults
+// for the flat keys leave TLS off.
+func TestTLSLegacyKeys(t *testing.T) {
+	base := `---
+server_url: https://headscale.example.com
+noise:
+  private_key_path: noise_private.key
+prefixes:
+  v4: 100.64.0.0/10
+database:
+  type: sqlite
+dns:
+  magic_dns: false
+  override_local_dns: false
+`
+
+	tests := []struct {
+		name string
+		yaml string
+		env  map[string]string
+		want TLSConfig
+	}{
+		{
+			name: "defaults",
+			yaml: base,
+			want: TLSConfig{ACME: ACMEConfig{
+				ChallengeType: HTTP01ChallengeType,
+				HTTPListen:    ":http",
+				CacheDir:      "/var/lib/headscale/cache",
+			}},
+		},
+		{
+			name: "legacy keys",
+			yaml: base + `tls_letsencrypt_hostname: headscale.example.com
+tls_letsencrypt_challenge_type: TLS-ALPN-01
+tls_letsencrypt_listen: ":8080"
+tls_letsencrypt_cache_dir: /var/lib/headscale/cache
+acme_url: https://acme.example.com/directory
+acme_email: admin@example.com
+`,
+			want: TLSConfig{ACME: ACMEConfig{
+				Hostname:      "headscale.example.com",
+				ChallengeType: TLSALPN01ChallengeType,
+				HTTPListen:    ":8080",
+				URL:           "https://acme.example.com/directory",
+				Email:         "admin@example.com",
+				CacheDir:      "/var/lib/headscale/cache",
+			}},
+		},
+		{
+			name: "tls keys win over legacy keys",
+			yaml: base + `tls_cert_path: /old/cert.pem
+tls_key_path: /old/key.pem
+tls:
+  cert_path: /new/cert.pem
+  key_path: /new/key.pem
+`,
+			want: TLSConfig{
+				CertPath: "/new/cert.pem",
+				KeyPath:  "/new/key.pem",
+				ACME: ACMEConfig{
+					ChallengeType: HTTP01ChallengeType,
+					HTTPListen:    ":http",
+					CacheDir:      "/var/lib/headscale/cache",
+				},
+			},
+		},
+		{
+			// What the NixOS module writes when TLS is off.
+			name: "nixos defaults",
+			yaml: base + `tls_letsencrypt_hostname: ""
+tls_letsencrypt_challenge_type: HTTP-01
+tls_letsencrypt_listen: ":http"
+tls_letsencrypt_cache_dir: /var/lib/headscale/.cache
+`,
+			want: TLSConfig{ACME: ACMEConfig{
+				ChallengeType: HTTP01ChallengeType,
+				HTTPListen:    ":http",
+				CacheDir:      "/var/lib/headscale/.cache",
+			}},
+		},
+		{
+			// Both keys read HEADSCALE_TLS_CERT_PATH.
+			name: "env",
+			yaml: base,
+			env: map[string]string{
+				"HEADSCALE_TLS_CERT_PATH": "/env/cert.pem",
+				"HEADSCALE_TLS_KEY_PATH":  "/env/key.pem",
+			},
+			want: TLSConfig{
+				CertPath: "/env/cert.pem",
+				KeyPath:  "/env/key.pem",
+				ACME: ACMEConfig{
+					ChallengeType: HTTP01ChallengeType,
+					HTTPListen:    ":http",
+					CacheDir:      "/var/lib/headscale/cache",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			viper.Reset()
+
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			tmpDir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(tt.yaml), 0o600))
+			require.NoError(t, LoadConfig(tmpDir, false))
+
+			cfg, err := LoadServerConfig()
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.TLS)
+		})
+	}
+}
+
+func TestPostgresConfigDSN(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  PostgresConfig
+		host string
+		port string
+		user string
+		pass string
+		path string
+		want map[string]string // expected query parameters
+	}{
+		//nolint:gosec // test fixture, not a credential
+		{
+			name: "ssl false disables sslmode",
+			cfg: PostgresConfig{
+				Host: "localhost",
+				Port: 5432,
+				Name: "headscale",
+				User: "hs",
+				Pass: "secret",
+				Ssl:  "false",
+			},
+			host: "localhost", port: "5432", user: "hs", pass: "secret", path: "/headscale",
+			want: map[string]string{"sslmode": "disable"},
+		},
+		{
+			name: "ssl true leaves the driver default",
+			cfg:  PostgresConfig{Host: "db", Name: "headscale", User: "hs", Ssl: "true"},
+			host: "db", user: "hs", path: "/headscale",
+			want: map[string]string{},
+		},
+		{
+			name: "raw sslmode is passed through",
+			cfg:  PostgresConfig{Host: "db", Name: "headscale", User: "hs", Ssl: "verify-full"},
+			host: "db", user: "hs", path: "/headscale",
+			want: map[string]string{"sslmode": "verify-full"},
+		},
+		// Regression: the DSN used to be concatenated, so a space, quote
+		// or backslash in the password truncated it or injected parameters.
+		//nolint:gosec // test fixture, not a credential
+		{
+			name: "password with reserved characters survives a round trip",
+			cfg: PostgresConfig{
+				Host: "db",
+				Name: "head scale",
+				User: "h's",
+				Pass: `p a'ss\w sslmode=disable #?&@`,
+			},
+			host: "db", user: "h's", pass: `p a'ss\w sslmode=disable #?&@`, path: "/head scale",
+			want: map[string]string{},
+		},
+		{
+			name: "unix socket directory goes in the host parameter",
+			cfg: PostgresConfig{
+				Host: "/var/run/postgresql",
+				Port: 5433,
+				Name: "headscale",
+				User: "hs",
+			},
+			user: "hs", path: "/headscale",
+			want: map[string]string{"host": "/var/run/postgresql", "port": "5433"},
+		},
+		{
+			name: "ipv6 host is bracketed",
+			cfg:  PostgresConfig{Host: "::1", Port: 5432, Name: "headscale", User: "hs"},
+			host: "::1", port: "5432", user: "hs", path: "/headscale",
+			want: map[string]string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u, err := url.Parse(tt.cfg.DSN())
+			require.NoError(t, err)
+
+			assert.Equal(t, "postgres", u.Scheme)
+			assert.Equal(t, tt.host, u.Hostname())
+			assert.Equal(t, tt.port, u.Port())
+			assert.Equal(t, tt.user, u.User.Username())
+			assert.Equal(t, tt.path, u.Path)
+
+			pass, _ := u.User.Password()
+			assert.Equal(t, tt.pass, pass)
+
+			query := u.Query()
+			assert.Len(t, query, len(tt.want))
+
+			for k, v := range tt.want {
+				assert.Equal(t, v, query.Get(k), k)
+			}
+		})
 	}
 }

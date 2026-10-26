@@ -135,12 +135,9 @@ func (b *MapResponseBuilder) WithCollectServicesDisabled() *MapResponseBuilder {
 	return b
 }
 
-// WithDebugConfig adds debug configuration
-// It disables log tailing if the mapper's LogTail is not enabled.
+// WithDebugConfig sets [tailcfg.MapResponse.Debug] from [types.Config.TailcfgDebug].
 func (b *MapResponseBuilder) WithDebugConfig() *MapResponseBuilder {
-	b.resp.Debug = &tailcfg.Debug{
-		DisableLogTail: !b.mapper.cfg.LogTail.Enabled,
-	}
+	b.resp.Debug = b.mapper.cfg.TailcfgDebug()
 
 	return b
 }
@@ -154,16 +151,15 @@ func (b *MapResponseBuilder) WithSSHPolicy() *MapResponseBuilder {
 
 	sshPolicy, err := b.mapper.state.SSHPolicy(node)
 	if err != nil {
-		// SSH policy is optional for a node to function. Rather than fail the
-		// whole map (leaving the node unable to connect), log and continue
-		// without it; the node still receives a usable netmap.
-		log.Warn().Caller().
+		// Don't fail the whole map over SSH, but fail closed: a nil
+		// SSHPolicy would leave the client's previous rules in force.
+		log.Error().Caller().
 			Err(err).
 			Uint64(zf.NodeID, node.ID().Uint64()).
 			Str(zf.NodeHostname, node.Hostname()).
-			Msg("building map response: skipping SSH policy for node; node will receive a map without SSH rules")
+			Msg("building map response: compiling SSH policy failed; sending empty SSH policy")
 
-		return b
+		sshPolicy = &tailcfg.SSHPolicy{Rules: []*tailcfg.SSHRule{}}
 	}
 
 	b.resp.SSHPolicy = sshPolicy
@@ -249,42 +245,30 @@ func (b *MapResponseBuilder) WithPeerChanges(peers views.Slice[types.NodeView]) 
 	return b
 }
 
-// buildTailPeers converts [views.Slice] of [types.NodeView] to a slice of [tailcfg.Node]
-// with policy filtering and sorting.
+// buildTailPeers converts [views.Slice] of [types.NodeView] to a sorted slice of
+// [tailcfg.Node]. The peers come from the NodeStore peer map, which already
+// decided visibility; only each peer's routes are filtered by policy here.
 func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) ([]*tailcfg.Node, error) {
 	node, ok := b.mapper.state.GetNodeByID(b.nodeID)
 	if !ok {
 		return nil, ErrNodeNotFoundMapper
 	}
 
-	// Get unreduced matchers for peer relationship determination.
-	// [State.MatchersForNode] returns unreduced matchers that include all rules where the
-	// node could be either source or destination. This is different from
-	// [State.FilterForNode] which returns reduced rules for packet filtering (only rules
-	// where node is destination).
+	// [State.RoutesForPeer] needs the unreduced matchers: every rule where the
+	// node is source or destination, not only the [State.FilterForNode] rules
+	// where it is destination.
 	matchers, err := b.mapper.state.MatchersForNode(node)
 	if err != nil {
 		return nil, err
 	}
 
-	// If there are filter rules present, see if there are any nodes that cannot
-	// access each-other at all and remove them from the peers.
-	var changedViews views.Slice[types.NodeView]
-	if len(matchers) > 0 {
-		changedViews = policy.ReduceNodes(node, peers, matchers)
-	} else {
-		changedViews = peers
-	}
-
-	// Snapshot the per-node policy CapMap once per peer-list build
-	// instead of locking the policy manager per peer. The per-call
-	// path used to take pm.mu N times for an N-peer response.
-	allCapMaps := b.mapper.state.NodeCapMaps()
+	// Snapshot these peers' policy caps under one policy-manager lock.
+	peerCapMaps := b.mapper.state.NodeCapMapsForPeers(peers)
 
 	// Build tail nodes with per-peer via-aware route function.
-	tailPeers := make([]*tailcfg.Node, 0, changedViews.Len())
+	tailPeers := make([]*tailcfg.Node, 0, peers.Len())
 
-	for _, peer := range changedViews.All() {
+	for _, peer := range peers.All() {
 		// Pass the peer's policy CapMap as selfPolicyCaps so per-peer
 		// address-shape rules (today: disable-ipv4) apply consistently
 		// in the viewer's netmap. The CapMap merge into tn.CapMap is
@@ -292,7 +276,7 @@ func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) (
 		// filtering side-effect inside TailNode survives.
 		tn, err := peer.TailNode(b.capVer, func(_ types.NodeID) []netip.Prefix {
 			return b.mapper.state.RoutesForPeer(node, peer, matchers)
-		}, b.mapper.cfg, allCapMaps[peer.ID()])
+		}, b.mapper.cfg, peerCapMaps[peer.ID()])
 		if err != nil {
 			// One peer with invalid data (e.g. an empty or over-long
 			// GivenName that fails GetFQDN) must not blank out the map for
@@ -312,12 +296,13 @@ func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) (
 		// [tailcfg.Node.CapMap] on a peer carries the small set of
 		// caps the Tailscale client reads from the peer view rather
 		// than the self view (suggest-exit-node, dns-subdomain-resolve
-		// — see ipn/ipnlocal/local.go:7534 and node_backend.go:745).
+		// — see [tailcfg.NodeAttrSuggestExitNode] and
+		// [tailcfg.NodeAttrDNSSubdomainResolve]).
 		// The Tailscale-hosted control plane stamps these only when
 		// the peer satisfies the cap's emission condition; every other
 		// cap stays off the peer view, leaving CapMap empty for most
 		// peers. [policyv2.PeerCapMap] encodes those conditions.
-		tn.CapMap = policyv2.PeerCapMap(peer, allCapMaps[peer.ID()])
+		tn.CapMap = policyv2.PeerCapMap(peer, peerCapMaps[peer.ID()])
 
 		tailPeers = append(tailPeers, tn)
 	}
@@ -360,6 +345,9 @@ func (b *MapResponseBuilder) Build() (*tailcfg.MapResponse, error) {
 		return nil, multierr.New(b.errs...)
 	}
 
+	// Dumps show the generated response; [generateMapResponse] drops it
+	// if it is left empty, and an unchanged SSHPolicy is dropped later,
+	// per connection, before it reaches the wire.
 	if debugDumpMapResponsePath != "" {
 		writeDebugMapResponse(b.resp, b.debugType, b.nodeID)
 	}
