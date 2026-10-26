@@ -3,6 +3,7 @@ package servertest
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -16,7 +17,9 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
+	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/wgengine/filter"
 )
 
 // TestClient wraps a Tailscale [controlclient.Direct] connected to a
@@ -38,9 +41,15 @@ type TestClient struct {
 	pollDone   chan struct{}
 
 	// Accumulated state from [tailcfg.MapResponse] callbacks.
-	mu      sync.RWMutex
-	netmap  *netmap.NetworkMap
-	history []*netmap.NetworkMap
+	mu              sync.RWMutex
+	netmap          *netmap.NetworkMap
+	history         []*netmap.NetworkMap
+	updatesReceived int
+	noHistory       bool
+
+	// deltaUpdates and deltaRemoved: see [WithDeltaUpdates].
+	deltaUpdates bool
+	deltaRemoved []tailcfg.NodeID
 
 	// updates is a buffered channel that receives a signal
 	// each time a new [netmap.NetworkMap] arrives.
@@ -55,10 +64,27 @@ type TestClient struct {
 type ClientOption func(*clientConfig)
 
 type clientConfig struct {
-	ephemeral bool
-	hostname  string
-	tags      []string
-	user      *types.User
+	ephemeral    bool
+	hostname     string
+	tags         []string
+	user         *types.User
+	deltaUpdates bool
+	noHistory    bool
+}
+
+// WithoutNetmapHistory retains only the latest netmap and one queued update.
+// Scale tests use this to avoid retaining every client's old peer lists.
+// [TestClient.UpdateCount] still counts every received full netmap.
+func WithoutNetmapHistory() ClientOption {
+	return func(c *clientConfig) { c.noHistory = true }
+}
+
+// WithDeltaUpdates makes the client accept incremental map updates the way
+// a real tailscaled does, and record the peer removals it could apply that
+// way ([TestClient.DeltaRemovedPeers]). Only those removals reach IPN bus
+// watchers opted out of full netmaps, such as the Android app.
+func WithDeltaUpdates() ClientOption {
+	return func(c *clientConfig) { c.deltaUpdates = true }
 }
 
 // WithEphemeral makes the client register as an ephemeral node.
@@ -146,16 +172,24 @@ func NewClient(tb testing.TB, server *TestServer, name string, opts ...ClientOpt
 		tb.Fatalf("servertest: NewDirect(%s): %v", name, err)
 	}
 
+	updateBuffer := 64
+	if cc.noHistory {
+		updateBuffer = 1
+	}
+
 	tc := &TestClient{
 		Name:    name,
 		server:  server,
 		direct:  direct,
 		authKey: authKey,
 		user:    user,
-		updates: make(chan *netmap.NetworkMap, 64),
+		updates: make(chan *netmap.NetworkMap, updateBuffer),
 		bus:     bus,
 		dialer:  dialer,
 		tracker: tracker,
+
+		deltaUpdates: cc.deltaUpdates,
+		noHistory:    cc.noHistory,
 	}
 
 	tb.Cleanup(func() {
@@ -205,7 +239,12 @@ func (c *TestClient) startPollLoop() {
 	go func() {
 		defer close(c.pollDone)
 
-		_ = c.direct.PollNetMap(c.pollCtx, c)
+		var updater controlclient.NetmapUpdater = c
+		if c.deltaUpdates {
+			updater = deltaRecorder{c}
+		}
+
+		_ = c.direct.PollNetMap(c.pollCtx, updater)
 	}()
 }
 
@@ -231,7 +270,11 @@ func (c *TestClient) resetNetmapState() {
 func (c *TestClient) UpdateFullNetmap(nm *netmap.NetworkMap) {
 	c.mu.Lock()
 	c.netmap = nm
-	c.history = append(c.history, nm)
+	c.updatesReceived++
+
+	if !c.noHistory {
+		c.history = append(c.history, nm)
+	}
 	c.mu.Unlock()
 
 	// Non-blocking send to the updates channel.
@@ -239,6 +282,43 @@ func (c *TestClient) UpdateFullNetmap(nm *netmap.NetworkMap) {
 	case c.updates <- nm:
 	default:
 	}
+}
+
+// deltaRecorder is the [controlclient.NetmapUpdater] of a [WithDeltaUpdates]
+// client. Like tailscaled it takes packet filter and user profile updates
+// narrowly, which lets [controlclient.Direct] try the delta path. It
+// records removals and declines the mutations, so the full netmap is
+// still delivered and the client's peer state stays exact.
+type deltaRecorder struct{ *TestClient }
+
+func (d deltaRecorder) UpdatePacketFilter(views.Slice[tailcfg.FilterRule], []filter.Match) bool {
+	return true
+}
+
+func (d deltaRecorder) UpdateUserProfiles(map[tailcfg.UserID]tailcfg.UserProfileView) bool {
+	return true
+}
+
+func (d deltaRecorder) UpdateNetmapDelta(muts []netmap.NodeMutation) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	for _, m := range muts {
+		if _, ok := m.(netmap.NodeMutationRemove); ok {
+			d.deltaRemoved = append(d.deltaRemoved, m.NodeIDBeingMutated())
+		}
+	}
+
+	return false
+}
+
+// DeltaRemovedPeers returns the peers whose removal arrived in a response
+// the client could apply incrementally; see [WithDeltaUpdates].
+func (c *TestClient) DeltaRemovedPeers() []tailcfg.NodeID {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return slices.Clone(c.deltaRemoved)
 }
 
 // cleanup releases all resources.
@@ -520,10 +600,11 @@ func (c *TestClient) UpdateCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return len(c.history)
+	return c.updatesReceived
 }
 
-// History returns a copy of all [netmap.NetworkMap] snapshots in order.
+// History returns the retained [netmap.NetworkMap] snapshots in order.
+// It is empty when [WithoutNetmapHistory] is set.
 func (c *TestClient) History() []*netmap.NetworkMap {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

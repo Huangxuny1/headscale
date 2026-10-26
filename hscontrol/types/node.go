@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	hsdns "github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
@@ -158,12 +159,12 @@ type Node struct {
 	// Tags cannot be removed once set (one-way transition).
 	Tags Strings `gorm:"column:tags;serializer:json"`
 
-	// When a node has been created with a [PreAuthKey], we need to
-	// prevent the preauthkey from being deleted before the node.
-	// The preauthkey can define "tags" of the node so we need it
-	// around.
+	// When a node has been created with a pre-auth key, we keep the key
+	// credential around: it can define the node's tags and must not be deleted
+	// before the node. The association is to the unified [Credential] (kind
+	// authkey), which is what auth_key_id references.
 	AuthKeyID *uint64 `sql:"DEFAULT:NULL"`
-	AuthKey   *PreAuthKey
+	AuthKey   *Credential
 
 	Expiry *time.Time
 
@@ -181,6 +182,8 @@ type Node struct {
 	UpdatedAt time.Time
 	DeletedAt *time.Time
 
+	// IsOnline caches [Node.ShouldBeOnline]; read it through [Node.Online].
+	// Every writer must derive it, so online means the same thing everywhere.
 	IsOnline *bool `gorm:"-"`
 
 	// Unhealthy excludes the node from primary route election while
@@ -189,10 +192,9 @@ type Node struct {
 
 	// ActiveSessions counts live poll sessions for this node.
 	// [State.Connect] increments it and every session release
-	// ([State.Disconnect]) decrements it, so the node goes offline
-	// exactly when its last session ends — regardless of the order in
-	// which overlapping sessions' cleanups run. Never persisted, like
-	// SessionEpoch.
+	// ([State.Disconnect]) decrements it. Releasing the last session
+	// takes the node offline; expiry can take it offline while sessions
+	// remain. Never persisted, like SessionEpoch.
 	ActiveSessions int `gorm:"-"`
 
 	// SessionEpoch identifies a poll session generation; Connect bumps
@@ -218,6 +220,11 @@ func (ns Nodes) ViewSlice() views.Slice[NodeView] {
 
 // IsExpired returns whether the node registration has expired.
 func (node *Node) IsExpired() bool {
+	return node.IsExpiredAt(time.Now())
+}
+
+// IsExpiredAt reports whether the node registration has expired at now.
+func (node *Node) IsExpiredAt(now time.Time) bool {
 	// If Expiry is not set, the client has not indicated that
 	// it wants an expiry time, it is therefore considered
 	// to mean "not expired"
@@ -225,7 +232,22 @@ func (node *Node) IsExpired() bool {
 		return false
 	}
 
-	return time.Since(*node.Expiry) > 0
+	return now.After(*node.Expiry)
+}
+
+// Online reports the node's last known connectivity. Unknown counts as
+// offline. Use [Node.ShouldBeOnline] to derive the value, not to read it.
+func (node *Node) Online() bool {
+	return node.IsOnline != nil && *node.IsOnline
+}
+
+// ShouldBeOnline derives what [Node.IsOnline] must hold from its two inputs:
+// a live control session and an unexpired node key. An expired client keeps
+// polling control to receive auth updates, so a session alone is not enough.
+// Call it only from a NodeStore write closure, where ActiveSessions is
+// stable; elsewhere read [Node.Online].
+func (node *Node) ShouldBeOnline() bool {
+	return node.ActiveSessions > 0 && !node.IsExpired()
 }
 
 // IsEphemeral returns if the node is registered as an Ephemeral node.
@@ -483,16 +505,6 @@ func (nodes Nodes) FilterByIP(ip netip.Addr) Nodes {
 	return found
 }
 
-func (nodes Nodes) ContainsNodeKey(nodeKey key.NodePublic) bool {
-	for _, node := range nodes {
-		if node.NodeKey == nodeKey {
-			return true
-		}
-	}
-
-	return false
-}
-
 func (node *Node) GetFQDN(baseDomain string) (string, error) {
 	if node.GivenName == "" {
 		return "", fmt.Errorf("creating valid FQDN: %w", ErrNodeHasNoGivenName)
@@ -649,7 +661,7 @@ func (node *Node) PeerChangeFromMapRequest(req tailcfg.MapRequest) tailcfg.PeerC
 
 	// Compare endpoints using order-independent comparison
 	if EndpointsChanged(node.Endpoints, req.Endpoints) {
-		ret.Endpoints = req.Endpoints
+		ret.Endpoints = slices.Clone(req.Endpoints)
 	}
 
 	now := time.Now()
@@ -773,6 +785,49 @@ func (nv NodeView) MarshalZerologObject(e *zerolog.Event) {
 
 	nv.ж.MarshalZerologObject(e)
 }
+
+// CertDomain returns the name the node may get a TLS certificate for with
+// `tailscale cert`: its MagicDNS name without the trailing dot, exactly as
+// the client matches it against its own name.
+func (nv NodeView) CertDomain(cfg *Config) (string, bool) {
+	if !nv.Valid() || !cfg.DNSConfig.Certificates.Enabled {
+		return "", false
+	}
+
+	fqdn, err := nv.GetFQDN(cfg.BaseDomain)
+	if err != nil {
+		return "", false
+	}
+
+	domain := strings.TrimSuffix(fqdn, ".")
+
+	// Names from before renames were lowercased can differ from another
+	// node's name by case only, while the challenge record cannot.
+	if domain != strings.ToLower(domain) || len(ACMEChallengePrefix+domain) > 253 {
+		return "", false
+	}
+
+	// A node names itself through its hostname, so it must not get a
+	// certificate for a name the operator gave to a service. A wildcard
+	// order shares its challenge record with the bare name, so names
+	// below the node's are covered too.
+	if cfg.extraRecordAtOrBelow(domain) {
+		return "", false
+	}
+
+	// A node may publish only its own name's challenge, which keeps it from
+	// other names' certificates only where the provider answers each name's
+	// challenge apart.
+	if iso, ok := cfg.DNSChallenge.Provider.(hsdns.Isolator); ok && !iso.Isolates(domain) {
+		return "", false
+	}
+
+	return domain, true
+}
+
+// ACMEChallengePrefix is prepended to a certificate name to form the TXT
+// record name of its ACME DNS-01 challenge.
+const ACMEChallengePrefix = "_acme-challenge."
 
 // Owner returns the owner for display purposes.
 // For tagged nodes, returns [TaggedDevices]. For user-owned nodes, returns the user.
@@ -915,6 +970,24 @@ func (nv NodeView) IsExpired() bool {
 	}
 
 	return nv.ж.IsExpired()
+}
+
+// IsExpiredAt reports whether the node registration has expired at now.
+func (nv NodeView) IsExpiredAt(now time.Time) bool {
+	if !nv.Valid() {
+		return true
+	}
+
+	return nv.ж.IsExpiredAt(now)
+}
+
+// Online reports the node's last known connectivity.
+func (nv NodeView) Online() bool {
+	if !nv.Valid() {
+		return false
+	}
+
+	return nv.ж.Online()
 }
 
 // IsEphemeral returns if the node is registered as an Ephemeral node.
@@ -1212,6 +1285,8 @@ func (nv NodeView) TailNode(
 	// Baseline caps every node receives, regardless of policy. Mirrors
 	// what Tailscale SaaS emits for a default tailnet.
 	// cfg.Taildrop.Enabled gates CapabilityFileSharing.
+	// cfg.DNSConfig.Certificates.Enabled gates HTTPS, without which
+	// `tailscale serve` refuses to serve HTTPS.
 	capMap := tailcfg.NodeCapMap{
 		nodecap.Admin: []tailcfg.RawMessage{},
 		nodecap.SSH:   []tailcfg.RawMessage{},
@@ -1219,6 +1294,10 @@ func (nv NodeView) TailNode(
 
 	if cfg.Taildrop.Enabled {
 		capMap[nodecap.FileSharing] = []tailcfg.RawMessage{}
+	}
+
+	if _, ok := nv.CertDomain(cfg); ok {
+		capMap[nodecap.HTTPS] = []tailcfg.RawMessage{}
 	}
 
 	// default-auto-update is always emitted; the value is a JSON bool

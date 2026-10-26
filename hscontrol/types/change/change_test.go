@@ -32,6 +32,83 @@ func TestChange_FieldSync(t *testing.T) {
 	}
 }
 
+// TestChange_FullUpdateSubsumesAllButPing classifies every [Change] field by
+// whether a full update covers it. A full is rendered from state at drain
+// time, so it covers anything describing state; a one-shot command is not
+// state and must survive the collapse. A new field fails here until it is
+// classified.
+func TestChange_FullUpdateSubsumesAllButPing(t *testing.T) {
+	const self = types.NodeID(1)
+
+	// true: the field carries a command the full cannot re-render.
+	carried := map[string]bool{
+		"Reason":                         false, // logging only
+		"TargetNode":                     false, // routing; the full is queued per node
+		"OriginNode":                     false, // self detection; the full includes self
+		"IncludeSelf":                    false,
+		"IncludeDERPMap":                 false,
+		"IncludeDNS":                     false,
+		"IncludeDomain":                  false,
+		"IncludePolicy":                  false,
+		"PeersChanged":                   false, // SendAllPeers re-lists every peer
+		"PeersRemoved":                   false, // diffed from the full's peer list
+		"PeerPatches":                    false, // peers rendered from current state
+		"SendAllPeers":                   false,
+		"DeletedNodes":                   false, // torn down in addToBatch before the collapse
+		"RequiresRuntimePeerComputation": false, // SendAllPeers recomputes visibility
+		"PingRequest":                    true,
+	}
+
+	typ := reflect.TypeFor[Change]()
+	require.Len(t, carried, typ.NumField(), "classify every Change field")
+
+	for field := range typ.Fields() {
+		t.Run(field.Name, func(t *testing.T) {
+			isCarried, ok := carried[field.Name]
+			require.True(t, ok, "field %s is not classified", field.Name)
+
+			// Addressed to self, so only the field under test decides.
+			c := Change{TargetNode: self}
+
+			v := reflect.ValueOf(&c).Elem().FieldByIndex(field.Index)
+			setNonZero(t, v, self)
+			require.False(t, v.IsZero())
+
+			got := CollapseToFull(self, []Change{c, FullUpdate()})
+
+			want := []Change{FullUpdate()}
+			if isCarried {
+				want = append(want, PingNode(self, c.PingRequest))
+			}
+
+			assert.Equal(t, want, got)
+		})
+	}
+}
+
+// setNonZero sets v to a non-zero value; node IDs get id so the change is
+// addressed to the node under test.
+func setNonZero(t *testing.T, v reflect.Value, id types.NodeID) {
+	t.Helper()
+
+	switch v.Kind() { //nolint:exhaustive // only the kinds Change uses; default fails the test
+	case reflect.Bool:
+		v.SetBool(true)
+	case reflect.String:
+		v.SetString("set")
+	case reflect.Uint64:
+		v.SetUint(id.Uint64())
+	case reflect.Pointer:
+		v.Set(reflect.New(v.Type().Elem()))
+	case reflect.Slice:
+		s := reflect.MakeSlice(v.Type(), 1, 1)
+		setNonZero(t, s.Index(0), id)
+		v.Set(s)
+	default:
+		t.Fatalf("setNonZero: unhandled kind %s", v.Kind())
+	}
+}
+
 func TestChange_IsEmpty(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -409,6 +486,149 @@ func TestDedupePolicyChanges(t *testing.T) {
 	}
 }
 
+func TestCoalescePeerDeltas(t *testing.T) {
+	const self types.NodeID = 1
+
+	merged := func(peers []types.NodeID, patches ...*tailcfg.PeerChange) Change {
+		return Change{Reason: "coalesced peer changes", PeersChanged: peers, PeerPatches: patches}
+	}
+	patch := func(c Change) *tailcfg.PeerChange { return c.PeerPatches[0] }
+
+	ping := PingNode(self, &tailcfg.PingRequest{URL: "https://example.com/ping"})
+
+	tests := []struct {
+		name    string
+		changes []Change
+		want    []Change
+	}{
+		{
+			name:    "single delta is unchanged",
+			changes: []Change{NodeAdded(2)},
+			want:    []Change{NodeAdded(2)},
+		},
+		{
+			name:    "join storm folds into one change",
+			changes: []Change{NodeAdded(3), NodeOnline(3), NodeAdded(2), NodeOnline(2)},
+			want:    []Change{merged([]types.NodeID{2, 3})},
+		},
+		{
+			name:    "patches for peers sent whole are dropped, others kept in order",
+			changes: []Change{NodeOnline(4), NodeAdded(2), NodeOffline(4), NodeOnline(2)},
+			want:    []Change{merged([]types.NodeID{2}, patch(NodeOnline(4)), patch(NodeOffline(4)))},
+		},
+		{
+			name: "runs do not cross other changes",
+			changes: []Change{
+				NodeAdded(2), NodeOnline(2), PolicyChange(), NodeAdded(3), PeersRemoved(4), NodeOnline(5), ping, NodeOnline(6),
+			},
+			want: []Change{
+				merged([]types.NodeID{2}), PolicyChange(), NodeAdded(3), PeersRemoved(4), NodeOnline(5), ping, NodeOnline(6),
+			},
+		},
+		{
+			name: "deletions fold into one removal ahead of the tick",
+			changes: []Change{
+				NodeAdded(2), NodeRemoved(5), NodeOnline(3), PolicyChange(), NodeRemoved(4), NodeAdded(6),
+			},
+			want: []Change{
+				{Reason: "node removed", PeersRemoved: []types.NodeID{4, 5}, DeletedNodes: []types.NodeID{4, 5}},
+				merged([]types.NodeID{2}, patch(NodeOnline(3))), PolicyChange(), NodeAdded(6),
+			},
+		},
+		{
+			name:    "the node's own change is a self update, not a peer delta",
+			changes: []Change{NodeAdded(2), NodeAdded(self), NodeAdded(3)},
+			want:    []Change{NodeAdded(2), NodeAdded(self), NodeAdded(3)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, CoalescePeerDeltas(self, tt.changes))
+		})
+	}
+}
+
+// TestCoalescePeerDeltasClassifiesEveryField classifies every [Change] field
+// by whether a change setting it may fold into a run of peer deltas. A new
+// field fails here until it is classified.
+func TestCoalescePeerDeltasClassifiesEveryField(t *testing.T) {
+	const self = types.NodeID(1)
+
+	folds := map[string]bool{
+		"Reason":                         true,  // logging only
+		"TargetNode":                     true,  // a node's pending only holds its own
+		"OriginNode":                     false, // set to self: a self update
+		"IncludeSelf":                    false,
+		"IncludeDERPMap":                 false,
+		"IncludeDNS":                     false,
+		"IncludeDomain":                  false,
+		"IncludePolicy":                  false,
+		"PeersChanged":                   true,
+		"PeersRemoved":                   false, // must stay ordered against re-adds
+		"PeerPatches":                    true,
+		"SendAllPeers":                   false,
+		"DeletedNodes":                   false,
+		"RequiresRuntimePeerComputation": false,
+		"PingRequest":                    false,
+	}
+
+	typ := reflect.TypeFor[Change]()
+	require.Len(t, folds, typ.NumField(), "classify every Change field")
+
+	for field := range typ.Fields() {
+		t.Run(field.Name, func(t *testing.T) {
+			want, ok := folds[field.Name]
+			require.True(t, ok, "field %s is not classified", field.Name)
+
+			c := Change{PeersChanged: []types.NodeID{2}}
+			setNonZero(t, reflect.ValueOf(&c).Elem().FieldByIndex(field.Index), self)
+
+			assert.Equal(t, want, c.isPeerDelta(self))
+		})
+	}
+}
+
+// TestCoalescePeerDeltasHoistsOnlyDeletions classifies every [Change] field
+// by whether a deletion setting it may still be hoisted ahead of the tick. A
+// new field fails here until it is classified.
+func TestCoalescePeerDeltasHoistsOnlyDeletions(t *testing.T) {
+	const self = types.NodeID(1)
+
+	hoists := map[string]bool{
+		"Reason":                         true,
+		"TargetNode":                     true,
+		"OriginNode":                     false,
+		"IncludeSelf":                    false,
+		"IncludeDERPMap":                 false,
+		"IncludeDNS":                     false,
+		"IncludeDomain":                  false,
+		"IncludePolicy":                  false,
+		"PeersChanged":                   false,
+		"PeersRemoved":                   true,
+		"PeerPatches":                    false,
+		"SendAllPeers":                   false,
+		"DeletedNodes":                   true,
+		"RequiresRuntimePeerComputation": false,
+		"PingRequest":                    false,
+	}
+
+	typ := reflect.TypeFor[Change]()
+	require.Len(t, hoists, typ.NumField(), "classify every Change field")
+
+	for field := range typ.Fields() {
+		t.Run(field.Name, func(t *testing.T) {
+			want, ok := hoists[field.Name]
+			require.True(t, ok, "field %s is not classified", field.Name)
+
+			c := NodeRemoved(2)
+			setNonZero(t, reflect.ValueOf(&c).Elem().FieldByIndex(field.Index), self)
+
+			assert.Equal(t, want, c.isDeletion())
+		})
+	}
+}
+
 func TestChange_Constructors(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -464,6 +684,7 @@ func TestSelfUpdate(t *testing.T) {
 	assert.Equal(t, "self update", r.Reason)
 	assert.Equal(t, types.NodeID(42), r.TargetNode)
 	assert.True(t, r.IncludeSelf)
+	assert.True(t, r.IncludeDNS, "DNS config derives from the node's own CapMap and Hostinfo")
 	assert.True(t, r.IsSelfOnly())
 }
 
@@ -584,6 +805,71 @@ func TestPingNode(t *testing.T) {
 	assert.True(t, r.IsTargetedToNode())
 	assert.False(t, r.IsEmpty())
 	assert.Equal(t, "ping", r.Type())
+}
+
+func TestCollapseToFullKeepsPings(t *testing.T) {
+	const self = types.NodeID(1)
+
+	prA := &tailcfg.PingRequest{URL: "https://example.com/ping/a"}
+	prB := &tailcfg.PingRequest{URL: "https://example.com/ping/b"}
+	prOther := &tailcfg.PingRequest{URL: "https://example.com/ping/other"}
+
+	tests := []struct {
+		name    string
+		changes []Change
+		want    []Change
+	}{
+		{
+			name:    "nil yields a lone full",
+			changes: nil,
+			want:    []Change{FullUpdate()},
+		},
+		{
+			name:    "state changes are subsumed",
+			changes: []Change{NodeOnline(2), PolicyChange(), SelfUpdate(self), UserRemoved()},
+			want:    []Change{FullUpdate()},
+		},
+		{
+			name:    "pings follow the full in order",
+			changes: []Change{PingNode(self, prA), NodeOnline(2), PingNode(self, prB)},
+			want:    []Change{FullUpdate(), PingNode(self, prA), PingNode(self, prB)},
+		},
+		{
+			name:    "ping for another node is not taken",
+			changes: []Change{PingNode(2, prOther), PingNode(self, prA)},
+			want:    []Change{FullUpdate(), PingNode(self, prA)},
+		},
+		{
+			name:    "merged ping is rescued ping-only",
+			changes: []Change{PingNode(self, prA).Merge(NodeOnline(3)).Merge(SelfUpdate(self))},
+			want:    []Change{FullUpdate(), PingNode(self, prA)},
+		},
+		{
+			name:    "untargeted ping is dropped",
+			changes: []Change{{Reason: "broadcast ping", PingRequest: prA}},
+			want:    []Change{FullUpdate()},
+		},
+		{
+			name:    "fulls never stack",
+			changes: []Change{FullUpdate(), PingNode(self, prA), UserAdded(), FullUpdate()},
+			want:    []Change{FullUpdate(), PingNode(self, prA)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CollapseToFull(self, tt.changes)
+			assert.Equal(t, tt.want, got)
+
+			require.NotEmpty(t, got)
+			assert.True(t, got[0].IsFull(), "first entry must be the full")
+
+			for _, c := range got[1:] {
+				assert.False(t, c.IsFull(), "only one full per collapse")
+				assert.Equal(t, PingNode(self, c.PingRequest), c, "rescued entries are ping-only")
+			}
+		})
+	}
 }
 
 func TestUniqueNodeIDs(t *testing.T) {

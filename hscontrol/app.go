@@ -2,22 +2,29 @@ package hscontrol
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
-	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/caddyserver/certmagic"
 	"github.com/cenkalti/backoff/v5"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/go-chi/chi/v5"
@@ -35,11 +42,11 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/juanfont/headscale/hscontrol/util/zlog"
+	"github.com/mholt/acmez/v3/acme"
 	"github.com/pkg/profile"
 	"github.com/rs/zerolog/log"
 	"github.com/sasha-s/go-deadlock"
-	"golang.org/x/crypto/acme"
-	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
@@ -90,16 +97,16 @@ type Headscale struct {
 	// router skips the mount and r.RemoteAddr stays as the TCP peer.
 	realIPMiddleware func(http.Handler) http.Handler
 
+	// challenges is nil unless dns.certificates is enabled.
+	challenges *dns.Challenges
+
 	// Things that generate changes
 	extraRecordMan *dns.ExtraRecordsMan
 	authProvider   AuthProvider
 	mapBatcher     *mapper.Batcher
 
-	// dnsProvider manages DNS records for ACME DNS-01 challenges
-	// (tailscale cert) and, in the future, Funnel A/AAAA records.
-	// Nil when cert support is disabled.
-	dnsProvider dns.Provider
-
+	// One per long-poll session, held through its Disconnect cleanup, so
+	// shutdown can close state after waiting on it.
 	clientStreamsOpen sync.WaitGroup
 }
 
@@ -136,6 +143,15 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		state:             s,
 	}
 
+	if cfg.DNSConfig.Certificates.Enabled {
+		app.challenges = dns.NewChallenges(
+			cfg.DNSChallenge.Provider,
+			cfg.DNSConfig.Certificates.Zone,
+			cfg.DNSChallenge.Resolvers,
+			cfg.DNSChallenge.PropagationTimeout,
+		)
+	}
+
 	if len(cfg.TrustedProxies) > 0 {
 		app.realIPMiddleware, err = trustedProxyRealIP(cfg.TrustedProxies)
 		if err != nil {
@@ -147,16 +163,28 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 	ephemeralGC := db.NewEphemeralGarbageCollector(func(ni types.NodeID) {
 		node, ok := app.state.GetNodeByID(ni)
 		if !ok {
-			log.Error().Uint64("node.id", ni.Uint64()).Msg("ephemeral node deletion failed")
-			log.Debug().Caller().Uint64("node.id", ni.Uint64()).Msg("ephemeral node deletion failed because node not found in NodeStore")
+			// A delete that raced this timer already did its job.
+			log.Debug().Caller().Uint64("node.id", ni.Uint64()).Msg("ephemeral node already deleted, skipping garbage collection")
 
 			return
 		}
 
-		policyChanged, err := app.state.DeleteNode(node)
-		if !policyChanged.IsEmpty() {
-			app.Change(policyChanged)
+		// Schedule and Cancel run outside the session transition, so a
+		// disconnecting session can arm a timer after a reconnect already
+		// cancelled it. The session count is authoritative; a stale timer
+		// is dropped and the next disconnect arms a fresh one. Not Online():
+		// an expired node keeps polling while offline.
+		// ponytail: a Connect between this check and DeleteNode still loses
+		// the node; only reachable after a full inactivity timeout. Needs a
+		// delete-if-idle in State if that edge matters.
+		if node.ActiveSessions() > 0 {
+			log.Debug().Caller().EmbedObject(node).Msg("ephemeral node has a live session, skipping garbage collection")
+
+			return
 		}
+
+		changes, err := app.state.DeleteNode(node)
+		app.Change(changes...)
 
 		if err != nil {
 			log.Error().Err(err).EmbedObject(node).Msg("ephemeral node deletion failed")
@@ -193,18 +221,6 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 
 	app.authProvider = authProvider
 
-	// Initialize DNS provider for cert/serve support.
-	if cfg.Cert.Enabled {
-		dnsProvider, err := dns.NewProvider(cfg.Cert)
-		if err != nil {
-			return nil, fmt.Errorf("initialising cert DNS provider: %w", err)
-		}
-
-		app.dnsProvider = dnsProvider
-
-		log.Info().Str("provider", cfg.Cert.DNSProvider.Name).Msg("cert support enabled with DNS provider")
-	}
-
 	if app.cfg.TailcfgDNSConfig != nil && app.cfg.TailcfgDNSConfig.Proxied { // if MagicDNS
 		// TODO(kradalby): revisit why this takes a list.
 		var magicDNSDomains []dnsname.FQDN
@@ -238,8 +254,7 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 			// DNS routes vanish, taking the resolver with them for ~6 min
 			// until the next route-changing netmap. Empty slice survives
 			// Clone and carries the same "resolve locally" semantics
-			// (tailscale.com/ipn/ipnlocal/node_backend.go:869 documents the
-			// empty-resolver Routes form for Issue 2706).
+			// ([tailcfg.DNSConfig.Routes] documents the empty-resolver form).
 			app.cfg.TailcfgDNSConfig.Routes[d.WithoutTrailingDot()] = []*dnstype.Resolver{}
 		}
 	}
@@ -394,7 +409,11 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 				}
 
 				if h.cfg.DERP.ServerEnabled && h.cfg.DERP.AutomaticallyAddEmbeddedDerpRegion {
-					region, _ := h.DERPServer.GenerateRegion()
+					region, err := h.DERPServer.GenerateRegion()
+					if err != nil {
+						return nil, fmt.Errorf("generating embedded DERP region: %w", err)
+					}
+
 					derpMap.Regions[region.RegionID] = &region
 				}
 
@@ -509,7 +528,7 @@ func (h *Headscale) createRouter(apiV1Mux, apiV2Mux http.Handler) *chi.Mux {
 		r.HandleFunc("/derp", h.DERPServer.DERPHandler)
 		r.HandleFunc("/derp/probe", derpServer.DERPProbeHandler)
 		r.HandleFunc("/derp/latency-check", derpServer.DERPProbeHandler)
-		r.HandleFunc("/bootstrap-dns", derpServer.DERPBootstrapDNSHandler(h.state.DERPMap()))
+		r.HandleFunc("/bootstrap-dns", derpServer.DERPBootstrapDNSHandler(h.state.DERPMap))
 	}
 
 	// Auth is enforced inside each Huma mux per-operation, so the whole API
@@ -581,7 +600,11 @@ func (h *Headscale) Serve() error {
 	}
 
 	if h.cfg.DERP.ServerEnabled && h.cfg.DERP.AutomaticallyAddEmbeddedDerpRegion {
-		region, _ := h.DERPServer.GenerateRegion()
+		region, err := h.DERPServer.GenerateRegion()
+		if err != nil {
+			return fmt.Errorf("generating embedded DERP region: %w", err)
+		}
+
 		derpMap.Regions[region.RegionID] = &region
 	}
 
@@ -695,10 +718,12 @@ func (h *Headscale) Serve() error {
 	// Set up REMOTE listeners
 	//
 
-	tlsConfig, err := h.getTLSSettings()
+	tlsBundle, err := h.getTLSSettings(ctx)
 	if err != nil {
 		return fmt.Errorf("configuring TLS settings: %w", err)
 	}
+
+	tlsConfig := tlsBundle.Config
 
 	//
 	//
@@ -728,13 +753,73 @@ func (h *Headscale) Serve() error {
 	}
 
 	if err != nil {
-		return fmt.Errorf("binding to TCP address: %w", err)
+		return &types.ListenerBindError{
+			Listener: "main HTTP",
+			YAMLKey:  "listen_addr",
+			Addr:     h.cfg.Addr,
+			Err:      err,
+		}
 	}
 
 	errorGroup.Go(func() error { return httpServer.Serve(httpListener) })
 
 	log.Info().
 		Msgf("listening and serving HTTP on: %s", h.cfg.Addr)
+
+	var (
+		insecureTLSServer   *http.Server
+		insecureTLSListener net.Listener
+	)
+
+	if addr := derpServer.DebugInsecureTLSListenAddr(); addr != "" {
+		insecureTLSConfig, err := selfSignedTLSConfig()
+		if err != nil {
+			return fmt.Errorf("creating self-signed TLS certificate: %w", err)
+		}
+
+		insecureTLSListener, err = tls.Listen("tcp", addr, insecureTLSConfig)
+		if err != nil {
+			return &types.ListenerBindError{
+				Listener: "insecure TLS",
+				YAMLKey:  "HEADSCALE_DEBUG_INSECURE_TLS_LISTEN_ADDR",
+				Addr:     addr,
+				Err:      err,
+			}
+		}
+
+		insecureTLSServer = &http.Server{
+			Handler:      router,
+			ReadTimeout:  types.HTTPTimeout,
+			WriteTimeout: types.HTTPTimeout,
+		}
+
+		errorGroup.Go(func() error { return insecureTLSServer.Serve(insecureTLSListener) })
+
+		log.Warn().
+			Str("addr", addr).
+			Msg("serving TLS with a self-signed certificate (HEADSCALE_DEBUG_INSECURE_TLS_LISTEN_ADDR); for tests only")
+	}
+
+	if tlsBundle.ACMEServer != nil {
+		log.Info().Msgf(
+			"listening and serving ACME HTTP-01 challenge on: %s",
+			tlsBundle.ACMEListener.Addr())
+		errorGroup.Go(func() error {
+			err := tlsBundle.ACMEServer.Serve(tlsBundle.ACMEListener)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return fmt.Errorf("ACME HTTP-01 challenge listener: %w", err)
+			}
+
+			return nil
+		})
+	}
+
+	if tlsBundle.Manage != nil {
+		err := tlsBundle.Manage(ctx)
+		if err != nil {
+			return fmt.Errorf("managing TLS certificate: %w", err)
+		}
+	}
 
 	// Only start debug/metrics server if address is configured
 	var debugHTTPServer *http.Server
@@ -744,7 +829,12 @@ func (h *Headscale) Serve() error {
 	if h.cfg.MetricsAddr != "" {
 		debugHTTPListener, err = (&net.ListenConfig{}).Listen(ctx, "tcp", h.cfg.MetricsAddr)
 		if err != nil {
-			return fmt.Errorf("binding to TCP address: %w", err)
+			return &types.ListenerBindError{
+				Listener: "metrics",
+				YAMLKey:  "metrics_listen_addr",
+				Addr:     h.cfg.MetricsAddr,
+				Err:      err,
+			}
 		}
 
 		debugHTTPServer = h.debugHTTPServer()
@@ -805,12 +895,12 @@ func (h *Headscale) Serve() error {
 				}
 
 				changes, err := h.state.ReloadPolicy()
+				h.Change(changes...)
+
 				if err != nil {
 					log.Error().Err(err).Msgf("reloading policy")
 					continue
 				}
-
-				h.Change(changes...)
 
 			default:
 				info := func(msg string) { log.Info().Msg(msg) }
@@ -845,6 +935,35 @@ func (h *Headscale) Serve() error {
 					log.Error().Err(err).Msg("failed to shutdown http")
 				}
 
+				if insecureTLSServer != nil {
+					info("shutting down insecure TLS server")
+
+					err := insecureTLSServer.Shutdown(shutdownCtx)
+					if err != nil {
+						log.Error().Err(err).Msg("failed to shutdown insecure TLS server")
+					}
+				}
+
+				if tlsBundle.ACMEServer != nil {
+					info("shutting down ACME HTTP-01 challenge server")
+
+					err := tlsBundle.ACMEServer.Shutdown(shutdownCtx)
+					if err != nil {
+						log.Error().Err(err).Msg("failed to shutdown ACME HTTP-01 server")
+					}
+
+					tlsBundle.ACMEListener.Close()
+				}
+
+				if tlsBundle.Stop != nil {
+					tlsBundle.Stop()
+				}
+
+				if h.challenges != nil {
+					info("removing pending ACME challenge records")
+					h.challenges.Close() //nolint:contextcheck // each delete has its own bounded context
+				}
+
 				info("closing batcher")
 				h.mapBatcher.Close()
 
@@ -871,9 +990,18 @@ func (h *Headscale) Serve() error {
 
 				httpListener.Close()
 
+				if insecureTLSListener != nil {
+					insecureTLSListener.Close()
+				}
+
 				// Stop listening (and unlink the socket if unix type):
 				info("closing socket listener")
 				socketListener.Close()
+
+				// The OIDC state cache runs its own TTL sweeper goroutine.
+				if p, ok := h.authProvider.(*AuthProviderOIDC); ok {
+					p.authCache.Close()
+				}
 
 				// Close state connections
 				info("closing state and database")
@@ -900,80 +1028,207 @@ func (h *Headscale) Serve() error {
 	return errorGroup.Wait()
 }
 
-func (h *Headscale) getTLSSettings() (*tls.Config, error) {
-	tlsEnabled := h.cfg.TLS.LetsEncrypt.Hostname != "" || h.cfg.TLS.CertPath != ""
+// tlsBundle carries the TLS settings produced by getTLSSettings. When
+// HTTP-01 ACME is configured, ACMEServer and ACMEListener are populated
+// so the caller can register the challenge listener with the errgroup
+// and wire it into the shutdown path. Otherwise both are nil.
+type tlsBundle struct {
+	Config       *tls.Config
+	ACMEServer   *http.Server
+	ACMEListener net.Listener
+
+	// Manage starts obtaining and renewing the certificate. It must run
+	// after the listeners are bound: the ACME library binds a challenge
+	// port itself when nothing serves it yet. Nil without ACME.
+	Manage func(context.Context) error
+	// Stop ends certificate maintenance. Nil without ACME.
+	Stop func()
+}
+
+// acmeTrustedRoots verifies the ACME directory; nil means the system roots.
+// Tests point it at their CA.
+var acmeTrustedRoots *x509.CertPool
+
+// acmeTLSSettings gets headscale's own certificate with certmagic, which
+// keeps it renewed. DNS-01 publishes the challenge through the same DNS
+// provider as node certificates.
+func (h *Headscale) acmeTLSSettings(ctx context.Context) (*tlsBundle, error) {
+	acmeCfg := h.cfg.TLS.ACME
+	logger := zlog.Zap(log.Logger).Named("acme")
+
+	// An empty CA means Let's Encrypt, and certmagic then retries failures
+	// against Let's Encrypt staging to spare the production rate limits.
+	issuer := certmagic.ACMEIssuer{
+		CA:           acmeCfg.URL,
+		Email:        acmeCfg.Email,
+		Agreed:       true,
+		TrustedRoots: acmeTrustedRoots,
+		Logger:       logger,
+	}
+
+	var err error
+
+	switch acmeCfg.ChallengeType {
+	case types.DNS01ChallengeType:
+		issuer.DNS01Solver = dns01Solver{
+			DNS01Solver: &certmagic.DNS01Solver{
+				DNSProvider: h.cfg.DNSChallenge.Provider,
+				TTL:         dns.ChallengeTTL,
+				Resolvers:   h.cfg.DNSChallenge.Resolvers,
+				Logger:      logger,
+			},
+			wait: dns.AwaitTXT(h.cfg.DNSChallenge.Resolvers, h.cfg.DNSChallenge.PropagationTimeout),
+		}
+
+	case types.TLSALPN01ChallengeType:
+		// Validated on the main listener, which must be reachable on port 443.
+		issuer.DisableHTTPChallenge = true
+		issuer.ListenHost, _, _ = net.SplitHostPort(h.cfg.Addr)
+
+		issuer.AltTLSALPNPort, err = types.PortFromAddr(h.cfg.Addr)
+		if err != nil {
+			return nil, fmt.Errorf("parsing listen_addr: %w", err)
+		}
+
+	case types.HTTP01ChallengeType:
+		// TLS-ALPN-01 stays on, as with autocert: setups that only open
+		// port 443 have always been validated that way.
+		issuer.AltTLSALPNPort, err = types.PortFromAddr(h.cfg.Addr)
+		if err != nil {
+			return nil, fmt.Errorf("parsing listen_addr: %w", err)
+		}
+
+		issuer.ListenHost, _, _ = net.SplitHostPort(acmeCfg.HTTPListen)
+
+		issuer.AltHTTPPort, err = types.PortFromAddr(acmeCfg.HTTPListen)
+		if err != nil {
+			return nil, fmt.Errorf("parsing tls.acme.http_listen: %w", err)
+		}
+
+	default:
+		return nil, errUnsupportedLetsEncryptChallengeType
+	}
+
+	var magic *certmagic.Config
+
+	cache := certmagic.NewCache(certmagic.CacheOptions{
+		GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) { return magic, nil },
+		Logger:           logger,
+	})
+	magic = certmagic.New(cache, certmagic.Config{
+		Storage: &certmagic.FileStorage{Path: acmeCfg.CacheDir},
+		Logger:  logger,
+	})
+
+	bundle := &tlsBundle{
+		Manage: func(ctx context.Context) error { return magic.ManageAsync(ctx, []string{acmeCfg.Hostname}) },
+		Stop:   cache.Stop,
+	}
+
+	acmeIssuer := certmagic.NewACMEIssuer(magic, issuer)
+	magic.Issuers = []certmagic.Issuer{acmeIssuer}
+
+	bundle.Config = magic.TLSConfig()
+	bundle.Config.NextProtos = append([]string{"h2", "http/1.1"}, bundle.Config.NextProtos...)
+	bundle.Config.MinVersion = tls.VersionTLS12
+
+	if acmeCfg.ChallengeType == types.HTTP01ChallengeType {
+		bundle.ACMEServer = &http.Server{
+			Addr:        acmeCfg.HTTPListen,
+			Handler:     acmeIssuer.HTTPChallengeHandler(http.HandlerFunc(h.redirect)),
+			ReadTimeout: types.HTTPTimeout,
+		}
+
+		bundle.ACMEListener, err = (&net.ListenConfig{}).Listen(ctx, "tcp", acmeCfg.HTTPListen)
+		if err != nil {
+			cache.Stop()
+
+			return nil, &types.ListenerBindError{
+				Listener: "ACME HTTP-01 challenge",
+				YAMLKey:  "tls.acme.http_listen",
+				Addr:     acmeCfg.HTTPListen,
+				Err:      err,
+			}
+		}
+	}
+
+	return bundle, nil
+}
+
+// dns01Solver checks propagation as for node certificates instead of the
+// way certmagic does: certmagic accepts the first nameserver serving the
+// value and follows only the first CNAME of a delegated challenge.
+type dns01Solver struct {
+	*certmagic.DNS01Solver
+
+	wait func(ctx context.Context, fqdn, value string) error
+}
+
+// Wait runs before the CA is asked to validate. When it fails, the ACME
+// client cleans the challenge up.
+func (s dns01Solver) Wait(ctx context.Context, ch acme.Challenge) error {
+	return s.wait(ctx, ch.DNS01TXTRecordName()+".", ch.DNS01KeyAuthorization())
+}
+
+func (h *Headscale) getTLSSettings(ctx context.Context) (*tlsBundle, error) {
+	tlsEnabled := h.cfg.TLS.ACME.Hostname != "" || h.cfg.TLS.CertPath != ""
 	if tlsEnabled && !strings.HasPrefix(h.cfg.ServerURL, "https://") {
 		log.Warn().Msg("listening with TLS but ServerURL does not start with https://")
 	} else if !tlsEnabled && !strings.HasPrefix(h.cfg.ServerURL, "http://") {
 		log.Warn().Msg("listening without TLS but ServerURL does not start with http://")
 	}
 
-	if h.cfg.TLS.LetsEncrypt.Hostname != "" {
-		certManager := autocert.Manager{
-			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(h.cfg.TLS.LetsEncrypt.Hostname),
-			Cache:      autocert.DirCache(h.cfg.TLS.LetsEncrypt.CacheDir),
-			Client: &acme.Client{
-				DirectoryURL: h.cfg.ACMEURL,
-				HTTPClient: &http.Client{
-					Transport: &acmeLogger{
-						rt: http.DefaultTransport,
-					},
-				},
-			},
-			Email: h.cfg.ACMEEmail,
-		}
-
-		switch h.cfg.TLS.LetsEncrypt.ChallengeType {
-		case types.TLSALPN01ChallengeType:
-			// Configuration via autocert with TLS-ALPN-01 (https://tools.ietf.org/html/rfc8737)
-			// The RFC requires that the validation is done on port 443; in other words, headscale
-			// must be reachable on port 443.
-			return certManager.TLSConfig(), nil
-
-		case types.HTTP01ChallengeType:
-			// Configuration via autocert with HTTP-01. This requires listening on
-			// port 80 for the certificate validation in addition to the headscale
-			// service, which can be configured to run on any other port.
-			server := &http.Server{
-				Addr:        h.cfg.TLS.LetsEncrypt.Listen,
-				Handler:     certManager.HTTPHandler(http.HandlerFunc(h.redirect)),
-				ReadTimeout: types.HTTPTimeout,
-			}
-
-			go func() {
-				err := server.ListenAndServe()
-				log.Fatal().
-					Caller().
-					Err(err).
-					Msg("failed to set up a HTTP server")
-			}()
-
-			return certManager.TLSConfig(), nil
-
-		default:
-			return nil, errUnsupportedLetsEncryptChallengeType
-		}
+	if h.cfg.TLS.ACME.Hostname != "" {
+		return h.acmeTLSSettings(ctx)
 	}
 
 	if h.cfg.TLS.CertPath == "" {
-		return nil, nil //nolint:nilnil // intentional: no TLS config when neither LetsEncrypt nor a cert path is set
-	}
-
-	tlsConfig := &tls.Config{
-		NextProtos:   []string{"http/1.1"},
-		Certificates: make([]tls.Certificate, 1),
-		MinVersion:   tls.VersionTLS12,
+		return &tlsBundle{}, nil
 	}
 
 	cert, err := tls.LoadX509KeyPair(h.cfg.TLS.CertPath, h.cfg.TLS.KeyPath)
 	if err != nil {
+		return nil, fmt.Errorf("loading TLS keypair (tls.cert_path=%q, tls.key_path=%q): %w",
+			h.cfg.TLS.CertPath, h.cfg.TLS.KeyPath, err)
+	}
+
+	tlsConfig := &tls.Config{
+		NextProtos:   []string{"http/1.1"},
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	return &tlsBundle{Config: tlsConfig}, nil
+}
+
+// selfSignedTLSConfig returns a TLS config with a fresh in-memory certificate.
+// Its only clients skip verification (DERP InsecureForTests, and the noise
+// dialer, which authenticates the server itself), so the subject and validity
+// are arbitrary.
+func selfSignedTLSConfig() (*tls.Config, error) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
 		return nil, err
 	}
 
-	tlsConfig.Certificates[0] = cert
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "headscale"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.AddDate(10, 0, 0),
+	}
 
-	return tlsConfig, nil
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)
+	if err != nil {
+		return nil, err
+	}
+
+	return &tls.Config{
+		NextProtos:   []string{"http/1.1"},
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: priv}},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
 }
 
 func readOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {
@@ -1026,7 +1281,15 @@ func readOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {
 // All change should be enqueued here and empty will be automatically
 // ignored.
 func (h *Headscale) Change(cs ...change.Change) {
-	h.mapBatcher.AddWork(cs...)
+	// Every delete path publishes its removal here; a deleted node's
+	// inactivity timer has nothing left to collect.
+	for _, c := range cs {
+		for _, id := range c.DeletedNodes {
+			h.ephemeralGC.Cancel(id)
+		}
+	}
+
+	h.mapBatcher.AddWork(slices.Concat(cs, h.state.DrainSelfRefreshes())...)
 }
 
 // HTTPHandler returns an [http.Handler] for the [Headscale] control server.
@@ -1070,14 +1333,17 @@ func (h *Headscale) SetServerURLForTest(tb testing.TB, url string) {
 }
 
 // StartBatcherForTest initialises and starts the map response batcher.
-// It registers a cleanup function on tb to stop the batcher.
+// It registers a cleanup function on tb to stop the batcher and wait for map sessions.
 // It panics when called outside of tests.
 func (h *Headscale) StartBatcherForTest(tb testing.TB) {
 	tb.Helper()
 
 	h.mapBatcher = mapper.NewBatcherAndMapper(h.cfg, h.state)
 	h.mapBatcher.Start()
-	tb.Cleanup(func() { h.mapBatcher.Close() })
+	tb.Cleanup(func() {
+		h.mapBatcher.Close()
+		h.clientStreamsOpen.Wait()
+	})
 }
 
 // MapBatcher returns the map response batcher (for test use).
@@ -1094,31 +1360,6 @@ func (h *Headscale) StartEphemeralGCForTest(tb testing.TB) {
 	go h.ephemeralGC.Start()
 
 	tb.Cleanup(func() { h.ephemeralGC.Close() })
-}
-
-// Provide some middleware that can inspect the ACME/autocert https calls
-// and log when things are failing.
-type acmeLogger struct {
-	rt http.RoundTripper
-}
-
-// RoundTrip will log when ACME/autocert failures happen either when err != nil OR
-// when http status codes indicate a failure has occurred.
-func (l *acmeLogger) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := l.rt.RoundTrip(req)
-	if err != nil {
-		log.Error().Err(err).Str("url", req.URL.String()).Msg("acme request failed")
-		return nil, err
-	}
-
-	if resp.StatusCode >= http.StatusBadRequest {
-		defer resp.Body.Close()
-
-		body, _ := io.ReadAll(resp.Body)
-		log.Error().Int("status_code", resp.StatusCode).Str("url", req.URL.String()).Bytes("body", body).Msg("acme request returned error")
-	}
-
-	return resp, nil
 }
 
 // [zerologRequestLogger] implements chi's [middleware.LogFormatter]

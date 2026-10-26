@@ -9,18 +9,20 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/metrics"
 	"github.com/juanfont/headscale/hscontrol/capver"
+	"github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"golang.org/x/net/http2"
 	"tailscale.com/control/controlbase"
 	"tailscale.com/control/controlhttp/controlhttpserver"
+	"tailscale.com/net/netutil"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -30,9 +32,6 @@ var ErrUnsupportedClientVersion = errors.New("unsupported client version")
 
 // ErrMissingURLParameter is returned when a required URL parameter is not provided.
 var ErrMissingURLParameter = errors.New("missing URL parameter")
-
-// ErrNoAuthSession is returned when an auth_id does not match any active auth session.
-var ErrNoAuthSession = errors.New("no auth session found")
 
 // ErrSSHDstNodeNotFound is returned when the dst node id on a Noise SSH
 // action request does not match any registered node.
@@ -77,10 +76,8 @@ const (
 type noiseServer struct {
 	headscale *Headscale
 
-	httpBaseConfig *http.Server
-	http2Server    *http2.Server
-	conn           *controlbase.Conn
-	machineKey     key.MachinePublic
+	conn       *controlbase.Conn
+	machineKey key.MachinePublic
 
 	// [tailcfg.EarlyNoise]-related stuff
 	challenge       key.ChallengePrivate
@@ -179,9 +176,6 @@ func (h *Headscale) NoiseUpgradeHandler(
 		// https://github.com/tailscale/tailscale/blob/dfba01ca9bd8c4df02c3c32f400d9aeb897c5fc7/cmd/tailscale/cli/debug.go#L1138
 		r.Get("/whoami", ns.NotImplementedHandler)
 
-		// client sends a [tailcfg.SetDNSRequest] to this endpoints and expect
-		// the server to create or update this DNS record "somewhere".
-		// It is typically a TXT record for an ACME challenge.
 		r.Post("/set-dns", ns.SetDNSHandler)
 
 		// A patch of [tailcfg.SetDeviceAttributesRequest] to update device attributes.
@@ -207,18 +201,16 @@ func (h *Headscale) NoiseUpgradeHandler(
 		r.Post("/c2n", ns.NotImplementedHandler)
 	})
 
-	ns.httpBaseConfig = &http.Server{
+	srv := &http.Server{
 		Handler:           r,
 		ReadHeaderTimeout: types.HTTPTimeout,
+		Protocols:         new(http.Protocols),
 	}
-	ns.http2Server = &http2.Server{}
+	// Noise already encrypts, so HTTP/2 runs without TLS.
+	srv.Protocols.SetUnencryptedHTTP2(true)
 
-	ns.http2Server.ServeConn(
-		noiseConn,
-		&http2.ServeConnOpts{
-			BaseConfig: ns.httpBaseConfig,
-		},
-	)
+	// Serve returns once the listener is drained; the connection outlives it.
+	_ = srv.Serve(netutil.NewOneConnListener(noiseConn, nil))
 }
 
 func unsupportedClientError(version tailcfg.CapabilityVersion) error {
@@ -430,6 +422,7 @@ func (ns *noiseServer) SSHActionHandler(
 		req.Context(),
 		reqLog,
 		srcNodeID, dstNodeID,
+		req.URL.Query().Get("local_user"),
 		req.URL.Query().Get("auth_id"),
 	)
 	if err != nil {
@@ -457,18 +450,20 @@ func (ns *noiseServer) SSHActionHandler(
 // sshAction resolves the SSH action for the given request parameters.
 // It returns the action to send to the client, or an [HTTPError] on failure.
 //
-// Three cases:
-//  1. Initial request, auto-approved — source recently authenticated
+// Four cases:
+//  1. No check rule covers the pair — reject; the client's rule is stale.
+//  2. Initial request, auto-approved — source recently authenticated
 //     within the check period, accept immediately.
-//  2. Initial request, needs auth — build a [tailcfg.SSHAction.HoldAndDelegate] URL and
+//  3. Initial request, needs auth — build a [tailcfg.SSHAction.HoldAndDelegate] URL and
 //     wait for the user to authenticate.
-//  3. Follow-up request — an auth_id is present, wait for the auth
-//     verdict and accept or reject.
+//  4. Follow-up request — an auth_id is present, wait for the auth
+//     verdict and accept or reject. A session that is gone or whose
+//     verdict another follow-up consumed is re-decided.
 func (ns *noiseServer) sshAction(
 	ctx context.Context,
 	reqLog zerolog.Logger,
 	srcNodeID, dstNodeID types.NodeID,
-	authIDStr string,
+	localUser, authIDStr string,
 ) (*tailcfg.SSHAction, error) {
 	action := tailcfg.SSHAction{
 		AllowAgentForwarding:      true,
@@ -478,21 +473,28 @@ func (ns *noiseServer) sshAction(
 
 	// Look up check params from the server's own policy rather than
 	// trusting URL parameters, which the client could tamper with.
+	// local_user only narrows which rule applies, and it comes from dst,
+	// the node enforcing the login.
 	checkPeriod, checkFound := ns.headscale.state.SSHCheckParams(
-		srcNodeID, dstNodeID,
+		srcNodeID, dstNodeID, localUser,
 	)
+
+	// Clients only call back for check rules they were sent. Without one in
+	// the current policy the client's copy is stale.
+	if !checkFound {
+		return sshActionDeny(reqLog, &action), nil
+	}
 
 	// Follow-up request with auth_id — wait for the auth verdict.
 	if authIDStr != "" {
 		return ns.sshActionFollowUp(
 			ctx, reqLog, &action, authIDStr,
-			srcNodeID, dstNodeID,
-			checkFound,
+			srcNodeID, dstNodeID, localUser,
 		)
 	}
 
 	// Initial request — check if auto-approval applies.
-	if checkFound && checkPeriod > 0 {
+	if checkPeriod > 0 {
 		if lastAuth, ok := ns.headscale.state.GetLastSSHAuth(
 			srcNodeID, dstNodeID,
 		); ok && time.Since(lastAuth) < checkPeriod {
@@ -508,7 +510,18 @@ func (ns *noiseServer) sshAction(
 	}
 
 	// No auto-approval — create an auth session and hold.
-	return ns.sshActionHoldAndDelegate(reqLog, &action, srcNodeID, dstNodeID)
+	return ns.sshActionHoldAndDelegate(reqLog, &action, srcNodeID, dstNodeID, localUser)
+}
+
+// sshActionDeny rejects a check the current policy does not require. It is a
+// 200 Reject, not an HTTP error: tailssh retries errors for up to 30 minutes.
+func sshActionDeny(reqLog zerolog.Logger, action *tailcfg.SSHAction) *tailcfg.SSHAction {
+	action.Reject = true
+	action.Message = "# Headscale SSH: no check rule in the tailnet policy covers this connection.\n"
+
+	reqLog.Info().Caller().Msg("SSH check denied: no matching check rule")
+
+	return action
 }
 
 // sshActionHoldAndDelegate creates a new auth session bound to the
@@ -518,11 +531,11 @@ func (ns *noiseServer) sshActionHoldAndDelegate(
 	reqLog zerolog.Logger,
 	action *tailcfg.SSHAction,
 	srcNodeID, dstNodeID types.NodeID,
+	localUser string,
 ) (*tailcfg.SSHAction, error) {
 	holdURL, err := url.Parse(
 		ns.headscale.cfg.ServerURL +
-			"/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID" +
-			"?local_user=$LOCAL_USER",
+			"/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID",
 	)
 	if err != nil {
 		return nil, NewHTTPError(
@@ -548,7 +561,10 @@ func (ns *noiseServer) sshActionHoldAndDelegate(
 
 	authURL := ns.headscale.authProvider.AuthURL(authID)
 
+	// The concrete user, not $LOCAL_USER: Encode escapes the placeholder
+	// and tailssh only expands it literally.
 	q := holdURL.Query()
+	q.Set("local_user", localUser)
 	q.Set("auth_id", authID.String())
 	holdURL.RawQuery = q.Encode()
 
@@ -579,7 +595,7 @@ func (ns *noiseServer) sshActionFollowUp(
 	action *tailcfg.SSHAction,
 	authIDStr string,
 	srcNodeID, dstNodeID types.NodeID,
-	checkFound bool,
+	localUser string,
 ) (*tailcfg.SSHAction, error) {
 	authID, err := types.AuthIDFromString(authIDStr)
 	if err != nil {
@@ -592,26 +608,20 @@ func (ns *noiseServer) sshActionFollowUp(
 
 	reqLog = reqLog.With().Str("auth_id", authID.String()).Logger()
 
+	// A missing session or consumed verdict must never approve access.
+	// The caller checked that the policy still requires authentication;
+	// re-delegate so the client can complete a fresh check.
+	sessionGone := func(logMsg string) (*tailcfg.SSHAction, error) {
+		reqLog.Info().Caller().Msg(logMsg)
+
+		return ns.sshActionHoldAndDelegate(
+			reqLog, action, srcNodeID, dstNodeID, localUser,
+		)
+	}
+
 	auth, ok := ns.headscale.state.GetAuthCacheEntry(authID)
 	if !ok {
-		// The session is gone (expired, evicted, or lost on a control-plane
-		// restart). A bare error dead-ends the client: it keeps polling this
-		// now-defunct auth_id until the SSH connection times out. Re-delegate
-		// so a still-required check can complete instead.
-		if checkFound {
-			reqLog.Info().Caller().
-				Msg("SSH check auth session missing; re-delegating")
-
-			return ns.sshActionHoldAndDelegate(
-				reqLog, action, srcNodeID, dstNodeID,
-			)
-		}
-
-		return nil, NewHTTPError(
-			http.StatusBadRequest,
-			"Invalid auth_id",
-			fmt.Errorf("%w: %s", ErrNoAuthSession, authID),
-		)
+		return sessionGone("SSH check auth session missing; re-delegating")
 	}
 
 	// Verify the cached binding matches the (src, dst) pair the
@@ -642,7 +652,11 @@ func (ns *noiseServer) sshActionFollowUp(
 
 	reqLog.Trace().Caller().Msg("SSH action follow-up")
 
-	var verdict types.AuthVerdict
+	var (
+		verdict   types.AuthVerdict
+		verdictOK bool
+	)
+
 	select {
 	case <-ctx.Done():
 		// The client disconnected (or its request timed out) before the
@@ -655,7 +669,14 @@ func (ns *noiseServer) sshActionFollowUp(
 			"ssh action follow-up cancelled",
 			ctx.Err(),
 		)
-	case verdict = <-auth.WaitForAuth():
+	case verdict, verdictOK = <-auth.WaitForAuth():
+	}
+
+	// FinishAuth buffers one verdict, then closes the channel. A closed
+	// receive yields the zero verdict, which Accept() reports as success,
+	// so a replayed follow-up would be approved even after a Reject.
+	if !verdictOK {
+		return sessionGone("SSH check verdict already consumed; re-delegating")
 	}
 
 	if !verdict.Accept() {
@@ -667,15 +688,19 @@ func (ns *noiseServer) sshActionFollowUp(
 		return action, nil
 	}
 
+	// The policy may have changed while the user authenticated, and the
+	// client won't drop a connection still waiting on its check.
+	if _, ok := ns.headscale.state.SSHCheckParams(srcNodeID, dstNodeID, localUser); !ok {
+		return sshActionDeny(reqLog, action), nil
+	}
+
 	action.Accept = true
 
 	// Record the successful auth for future auto-approval.
-	if checkFound {
-		ns.headscale.state.SetLastSSHAuth(srcNodeID, dstNodeID)
+	ns.headscale.state.SetLastSSHAuth(srcNodeID, dstNodeID)
 
-		reqLog.Trace().Caller().
-			Msg("auth recorded for auto-approval")
-	}
+	reqLog.Trace().Caller().
+		Msg("auth recorded for auto-approval")
 
 	return action, nil
 }
@@ -725,6 +750,8 @@ func (ns *noiseServer) PollNetMapHandler(
 					KeyExpiry: time.Unix(1, 0).UTC(),
 					Expired:   true,
 				},
+				// This frame opens the stream in place of the initial map.
+				Debug: ns.headscale.cfg.TailcfgDebug(),
 			}
 
 			err = writeMapResponse(writer, mapRequest.Compress, true, expired)
@@ -750,6 +777,119 @@ func (ns *noiseServer) PollNetMapHandler(
 	}
 }
 
+// challengeValueRE matches an ACME DNS-01 TXT value: the unpadded
+// base64url SHA-256 of the key authorization (RFC 8555 section 8.4).
+var challengeValueRE = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+
+// SetDNSHandler publishes the TXT record of an ACME DNS-01 challenge for
+// `tailscale cert`. The client runs ACME itself and asks the CA to
+// validate as soon as this returns, so it only answers 200 once the
+// record is visible. The client never asks for removal; [dns.Challenges]
+// removes the record later.
+func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Request) {
+	challenges := ns.headscale.challenges
+	if challenges == nil {
+		http.Error(writer, "HTTPS certificates are not enabled on this headscale server", http.StatusNotImplemented)
+
+		return
+	}
+
+	var setDNS tailcfg.SetDNSRequest
+
+	err := json.NewDecoder(req.Body).Decode(&setDNS)
+	if err != nil {
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "invalid set-dns request", err))
+
+		return
+	}
+
+	if rejectUnsupported(writer, setDNS.Version, ns.machineKey, setDNS.NodeKey) {
+		return
+	}
+
+	nv, ok := ns.headscale.state.GetNodeByNodeKey(setDNS.NodeKey)
+	if !ok {
+		httpError(writer, NewHTTPError(http.StatusNotFound, "node not found", errNodeNotInStore))
+
+		return
+	}
+
+	err = machineKeyMismatch(nv, ns.machineKey)
+	if err != nil {
+		httpError(writer, err)
+
+		return
+	}
+
+	name, err := validateSetDNS(setDNS, nv, ns.headscale.cfg)
+	if err != nil {
+		httpError(writer, err)
+
+		return
+	}
+
+	err = challenges.Present(req.Context(), nv.ID().Uint64(), name, setDNS.Value)
+	if err != nil {
+		switch {
+		case errors.Is(err, dns.ErrTooManyChallenges):
+			err = NewHTTPError(http.StatusTooManyRequests, "too many pending certificate challenges, try again later", err)
+		case errors.Is(err, dns.ErrChallengesClosed):
+			err = NewHTTPError(http.StatusServiceUnavailable, "headscale is shutting down, try again later", err)
+		case errors.Is(err, dns.ErrChallengeProvider):
+			err = NewHTTPError(http.StatusBadGateway, "DNS provider could not create the record, see the headscale log", err)
+		default:
+			err = NewHTTPError(http.StatusGatewayTimeout, "DNS record not visible on all nameservers yet, try again", err)
+		}
+
+		httpError(writer, err)
+
+		return
+	}
+
+	log.Debug().EmbedObject(nv).Str("name", name).Msg("ACME challenge ready for validation")
+
+	writer.Header().Set("Content-Type", "application/json")
+
+	// The client fails on an empty body, so the empty response is encoded.
+	err = json.NewEncoder(writer).Encode(tailcfg.SetDNSResponse{})
+	if err != nil {
+		log.Error().Caller().Err(err).Msg("writing set-dns response")
+	}
+}
+
+// validateSetDNS lets a node publish only the challenge of its own
+// certificate name, and returns that name. The Noise endpoint accepts any
+// machine key and the client's LocalAPI forwards any name and value, so
+// this is what stops a node from writing arbitrary records into the
+// operator's zone.
+func validateSetDNS(req tailcfg.SetDNSRequest, nv types.NodeView, cfg *types.Config) (string, error) {
+	if nv.IsExpired() {
+		return "", NewHTTPError(http.StatusForbidden, "node is expired", nil)
+	}
+
+	domain, ok := nv.CertDomain(cfg)
+	if !ok {
+		return "", NewHTTPError(http.StatusForbidden, "node has no certificate name", nil)
+	}
+
+	if req.Type != "TXT" {
+		return "", NewHTTPError(http.StatusBadRequest, "only TXT records are supported", nil)
+	}
+
+	// The client sends the name built from CertDomains, so it matches
+	// exactly; folding case would let lookalike Unicode letters match.
+	name := types.ACMEChallengePrefix + domain
+	if req.Name != name {
+		return "", NewHTTPError(http.StatusForbidden, "name is not the ACME challenge of this node's certificate", nil)
+	}
+
+	if !challengeValueRE.MatchString(req.Value) {
+		return "", NewHTTPError(http.StatusBadRequest, "value is not an ACME DNS-01 challenge", nil)
+	}
+
+	return name, nil
+}
+
 func regErr(err error) *tailcfg.RegisterResponse {
 	return &tailcfg.RegisterResponse{Error: err.Error()}
 }
@@ -765,36 +905,35 @@ func (ns *noiseServer) RegistrationHandler(
 		return
 	}
 
-	registerRequest, registerResponse := func() (*tailcfg.RegisterRequest, *tailcfg.RegisterResponse) { //nolint:contextcheck
-		var resp *tailcfg.RegisterResponse
+	var registerRequest tailcfg.RegisterRequest
 
-		var regReq tailcfg.RegisterRequest
+	decodeErr := json.NewDecoder(req.Body).Decode(&registerRequest)
 
-		err := json.NewDecoder(req.Body).Decode(&regReq)
-		if err != nil {
-			return &regReq, regErr(err)
-		}
-
-		resp, err = ns.headscale.handleRegister(req.Context(), regReq, ns.conn.Peer())
-		if err != nil {
-			if httpErr, ok := errors.AsType[HTTPError](err); ok {
-				resp = &tailcfg.RegisterResponse{
-					Error: httpErr.Msg,
-				}
-
-				return &regReq, resp
-			}
-
-			return &regReq, regErr(err)
-		}
-
-		return &regReq, resp
-	}()
-
-	// Reject unsupported versions
+	// The floor must be enforced before handleRegister: a logout, pre-auth
+	// key use or auth-cache write it performs is not undone by a later 400.
+	// A failed decode still gets checked against whatever Version it read.
 	if rejectUnsupported(writer, registerRequest.Version, ns.machineKey, registerRequest.NodeKey) {
 		return
 	}
+
+	registerResponse := func() *tailcfg.RegisterResponse { //nolint:contextcheck
+		if decodeErr != nil {
+			return regErr(decodeErr)
+		}
+
+		resp, err := ns.headscale.handleRegister(req.Context(), registerRequest, ns.machineKey)
+		if err != nil {
+			if httpErr, ok := errors.AsType[HTTPError](err); ok {
+				return &tailcfg.RegisterResponse{
+					Error: httpErr.Msg,
+				}
+			}
+
+			return regErr(err)
+		}
+
+		return resp
+	}()
 
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)

@@ -21,15 +21,19 @@ type PolicyManager interface {
 	// BuildPeerMap constructs peer relationship maps for the given nodes
 	BuildPeerMap(nodes views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID
 	SSHPolicy(baseURL string, node types.NodeView) (*tailcfg.SSHPolicy, error)
-	// SSHCheckParams resolves the SSH check period for a (src, dst) pair
-	// from the current policy, avoiding trust of client-provided URL params.
-	SSHCheckParams(srcNodeID, dstNodeID types.NodeID) (time.Duration, bool)
+	// SSHCheckParams resolves the SSH check period for src logging in to
+	// dst as localUser from the current policy, avoiding trust of
+	// client-provided URL params.
+	SSHCheckParams(srcNodeID, dstNodeID types.NodeID, localUser string) (time.Duration, bool)
 	SetPolicy(pol []byte) (bool, error)
 	// SetUsers replaces the user list. policyChanged reports whether clients
 	// need a policy refresh; peerMapChanged reports whether user-derived peer
 	// adjacency may have changed. Both are false when the list is unchanged.
 	SetUsers(users []types.User) (policyChanged, peerMapChanged bool, err error)
 	SetNodes(nodes views.Slice[types.NodeView]) (bool, error)
+	// NodesGeneration counts SetNodes calls that reported a change; see
+	// [policyv2.PolicyManager.NodesGeneration].
+	NodesGeneration() uint64
 	// NodeCanHaveTag reports whether the given node can have the given tag.
 	NodeCanHaveTag(node types.NodeView, tag string) bool
 
@@ -65,18 +69,22 @@ type PolicyManager interface {
 	// both fields are empty and the caller falls back to existing behavior.
 	ViaRoutesForPeer(viewer, peer types.NodeView) types.ViaRouteResult
 
-	// NodeCapMap returns the policy-derived CapMap for the given node,
-	// or nil when no nodeAttrs entry targets it. The returned map is
-	// owned by the manager; treat it as read-only and copy before
-	// merging into a [tailcfg.Node]. It describes the node's own
-	// capabilities, not a per-viewer view.
+	// NodeCapMap returns compiled policy capabilities for the given node,
+	// or nil when none target it. The map is a defensive clone; its values
+	// are shared and read-only. It describes the node's own capabilities,
+	// not a per-viewer view.
 	NodeCapMap(id types.NodeID) tailcfg.NodeCapMap
 
-	// NodeCapMaps returns a snapshot of the per-node policy CapMap so
-	// callers can amortise lock acquisitions over a peer loop. The
-	// outer map is a fresh container; the inner [tailcfg.NodeCapMap]
-	// values are shared with the manager and read-only.
+	// NodeCapMaps snapshots every node's policy CapMap. The outer map is
+	// caller-owned; inner maps are shared with the manager and read-only.
+	// NodeCapMapsForPeers limits copying when fewer peers are requested.
 	NodeCapMaps() map[types.NodeID]tailcfg.NodeCapMap
+
+	// NodeCapMapsForPeers snapshots requested peer caps under one lock. It may
+	// include unselected entries when copying the whole compiled table is less work.
+	// The outer map is caller-owned; inner maps are shared and read-only.
+	// Empty selections or no compiled policy capabilities return nil; missing IDs read nil.
+	NodeCapMapsForPeers(peers views.Slice[types.NodeView]) map[types.NodeID]tailcfg.NodeCapMap
 
 	// NodesWithChangedCapMap returns the IDs of nodes whose nodeAttrs
 	// CapMap shifted during recent updateLocked calls. The buffer

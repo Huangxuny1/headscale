@@ -1,6 +1,7 @@
 package v2
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"iter"
@@ -429,6 +430,13 @@ func (u *Username) resolve(_ *Policy, users types.Users, nodes views.Slice[types
 	)
 
 	user, err := u.resolveUser(users)
+	if errors.Is(err, ErrUserNotFound) {
+		// A policy may name users before they register (#2863). Report it
+		// as an empty set, not an error: callers that bail on error would
+		// otherwise drop a whole group for one missing member (#3513).
+		return &netipx.IPSet{}, nil
+	}
+
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -566,6 +574,14 @@ func (t *Tag) Resolve(p *Policy, users types.Users, nodes views.Slice[types.Node
 
 func (t *Tag) resolve(p *Policy, users types.Users, nodes views.Slice[types.NodeView]) (*netipx.IPSet, error) {
 	var ips netipx.IPSetBuilder
+
+	if p != nil && p.nodesByTag != nil {
+		for _, node := range p.nodesByTag[string(*t)] {
+			node.AppendToIPSet(&ips)
+		}
+
+		return ips.IPSet()
+	}
 
 	for _, node := range nodes.All() {
 		// Check if node has this tag
@@ -1831,48 +1847,6 @@ type ACL struct {
 	Destinations []AliasWithPorts `json:"dst"`
 }
 
-// UnmarshalJSON implements custom unmarshalling for [ACL] that ignores fields starting with '#'.
-// headscale-admin uses # in some field names to add metadata, so we will ignore
-// those to ensure it doesnt break.
-// https://github.com/GoodiesHQ/headscale-admin/blob/214a44a9c15c92d2b42383f131b51df10c84017c/src/lib/common/acl.svelte.ts#L38
-func (a *ACL) UnmarshalJSON(b []byte) error {
-	// First unmarshal into a map to filter out comment fields
-	var raw map[string]any
-	if err := json.Unmarshal(b, &raw, policyJSONOpts...); err != nil { //nolint:noinlineerr
-		return err
-	}
-
-	// Remove any fields that start with '#'
-	filtered := make(map[string]any)
-
-	for key, value := range raw {
-		if !strings.HasPrefix(key, "#") {
-			filtered[key] = value
-		}
-	}
-
-	// Marshal the filtered map back to JSON
-	filteredBytes, err := json.Marshal(filtered)
-	if err != nil {
-		return err
-	}
-
-	// Create a type alias to avoid infinite recursion
-	type aclAlias ACL
-
-	var temp aclAlias
-
-	// Unmarshal into the temporary struct using the v2 JSON options
-	if err := json.Unmarshal(filteredBytes, &temp, policyJSONOpts...); err != nil { //nolint:noinlineerr
-		return err
-	}
-
-	// Copy the result back to the original struct
-	*a = ACL(temp)
-
-	return nil
-}
-
 type Grant struct {
 	// TODO(kradalby): Validate grant src/dst according to ts docs
 	Sources      Aliases `json:"src"`
@@ -1883,6 +1857,11 @@ type Grant struct {
 	App               tailcfg.PeerCapMap `json:"app,omitzero"`
 
 	Via []Tag `json:"via,omitzero"`
+}
+
+// HasVia reports whether the grant routes through via-tagged nodes.
+func (g Grant) HasVia() bool {
+	return len(g.Via) > 0
 }
 
 // NodeAttrGrant attaches Tailscale node capabilities (and/or an IP-pool
@@ -1990,6 +1969,33 @@ type Policy struct {
 	Tests               []PolicyTest       `json:"tests,omitempty"`
 	SSHTests            []SSHPolicyTest    `json:"sshTests,omitempty"`
 	RandomizeClientPort bool               `json:"randomizeClientPort,omitempty"`
+
+	// nodesByTag is set only on the copy [Policy.withNodesByTag] makes for
+	// one compile, and indexes the nodes that compile resolves against.
+	nodesByTag map[string][]types.NodeView
+}
+
+// withNodesByTag returns a copy of pol to resolve against nodes, and only
+// nodes. Its tag aliases look their members up instead of scanning every
+// node: a compile resolves every tag alias occurrence, so with many tags the
+// scans were most of the compile.
+func (pol *Policy) withNodesByTag(nodes views.Slice[types.NodeView]) *Policy {
+	if pol == nil {
+		return nil
+	}
+
+	byTag := make(map[string][]types.NodeView)
+
+	for _, node := range nodes.All() {
+		for _, tag := range node.Tags().All() {
+			byTag[tag] = append(byTag[tag], node)
+		}
+	}
+
+	indexed := *pol
+	indexed.nodesByTag = byTag
+
+	return &indexed
 }
 
 // MarshalJSON is deliberately not implemented for [Policy].
@@ -3113,6 +3119,42 @@ func (u *SSHUser) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// stripMetadataMembers removes every object member whose name starts with '#'
+// from the policy AST. Policy editors such as headscale-admin store their own
+// metadata in such members, and the policy decoder rejects unknown fields, so
+// they are dropped before decoding instead of rejected. Deleting a member can
+// leave a trailing comma behind; [hujson.Value.Standardize] removes it.
+// https://github.com/GoodiesHQ/headscale-admin/blob/214a44a9c15c92d2b42383f131b51df10c84017c/src/lib/common/acl.svelte.ts#L38
+//
+// Grant "app" values are opaque capability payloads handed to peers verbatim,
+// not policy schema, so they are left untouched.
+func stripMetadataMembers(v *hujson.Value) {
+	switch val := v.Value.(type) {
+	case *hujson.Object:
+		kept := val.Members[:0]
+
+		for i := range val.Members {
+			name, isString := val.Members[i].Name.Value.(hujson.Literal)
+			if isString && strings.HasPrefix(name.String(), "#") {
+				continue
+			}
+
+			if !isString || name.String() != "app" {
+				stripMetadataMembers(&val.Members[i].Value)
+			}
+
+			kept = append(kept, val.Members[i])
+		}
+
+		val.Members = kept
+
+	case *hujson.Array:
+		for i := range val.Elements {
+			stripMetadataMembers(&val.Elements[i])
+		}
+	}
+}
+
 // unmarshalPolicy takes a byte slice and unmarshals it into a [Policy] struct.
 // In addition to unmarshalling, it will also validate the policy.
 // This is the only entrypoint of reading a policy from a file or other source.
@@ -3123,11 +3165,14 @@ func unmarshalPolicy(b []byte) (*Policy, error) {
 
 	var policy Policy
 
-	ast, err := hujson.Parse(b)
+	// The AST aliases its input and Standardize blanks comments in place;
+	// callers store b as written.
+	ast, err := hujson.Parse(bytes.Clone(b))
 	if err != nil {
 		return nil, fmt.Errorf("parsing HuJSON: %w", err)
 	}
 
+	stripMetadataMembers(&ast)
 	ast.Standardize()
 
 	if err = json.Unmarshal(ast.Pack(), &policy, policyJSONOpts...); err != nil { //nolint:noinlineerr
