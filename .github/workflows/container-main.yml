@@ -18,7 +18,7 @@ concurrency:
 
 defaults:
   run:
-    shell: nix develop --fallback --command bash -e {1}
+    shell: nix develop --fallback --command bash -e {0}
 
 jobs:
   container:
